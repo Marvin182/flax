@@ -1,6 +1,7 @@
 from anchor import *
 from util import *
 from flax.nn.initializers import normal
+from jax import numpy as jnp
 
 import flax
 import jax
