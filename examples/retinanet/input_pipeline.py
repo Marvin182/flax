@@ -1,11 +1,14 @@
 from flax import jax_utils
+from jax import numpy as jnp
 from os import getenv
 
 import itertools
 import jax
-import tensorflow.compat.v2 as tf
+import tensorflow as tf
 import tensorflow_datasets as tfds
 
+# These are constants relevant for the data preprocessing stage 
+MAX_PADDING_ROWS = 100
 
 # These are the mean and std. dev of the COCO dataset
 # TODO: compute the actual mean and std dev of the MS COCO dataset
@@ -17,20 +20,68 @@ def preprocess_wrapper(func):
   """Which wraps `func`, such that the COCO data format is maintained.
 
   More specifically, it allows `func` to only implement logic for processing
-  images, without having to deal with the logic of maintaining the dictionary
-  structure implicitly produced by TFDS.
+  images, without having to deal with the logic of unpacking or rescaling 
+  the bboxes. 
 
   Args:
     func: a function which takes a single unnamed parameter - the image -,
-      processes it and then returns it.
+      processes it and returns it, and the new scale of the image.
 
   Returns:
     A function which can be passed a COCO data dictionary as produced by TFDS
   """
+  def _pad(data, output_rows, pad_dtype=tf.float32):
+    """Adds extra rows to the data. 
+
+    Args:
+      data: a 1D or 2D dataset to be padded
+      output_rows: a scalar indicating the number of rows of the padded data
+      pad_dtype: the TF dtype used for padding
+
+    Returns:
+      The padded data
+    """
+    data_shape = tf.shape(data)
+    to_pad = tf.math.maximum(0, output_rows - data_shape[0])
+    padding_shape = [to_pad, data_shape[1]] if len(data_shape) == 2 else to_pad
+    padding = tf.zeros(padding_shape, dtype=pad_dtype)
+    return tf.concat([data, padding], axis=0)
+
   def _inner(data):
-    return {"image": func(data["image"]), "image/id": data["image/id"],
-            "image/filename": data["image/filename"],
-            "objects": data["objects"]}
+    # Preprocess the image, and compute the size of the new image
+    new_image, ratio = func(data["image"])
+    original_image_size = tf.cast(tf.shape(data["image"]), tf.float32)
+    new_image_h = original_image_size[0] * ratio
+    new_image_w = original_image_size[1] * ratio
+    new_image_c = tf.cast(original_image_size[2], tf.int32)
+
+    # Unpack and de-normalize the bboxes
+    is_crowd = data["objects"]["is_crowd"]
+    labels = data["objects"]["label"]
+    bboxes = data["objects"]["bbox"]
+    bbox_count = tf.shape(bboxes)[0]
+
+    # Invert the x's and y's, to make access more intuitive
+    y1 = bboxes[:, 0] * new_image_h
+    x1 = bboxes[:, 1] * new_image_w
+    y2 = bboxes[:, 2] * new_image_h
+    x2 = bboxes[:, 3] * new_image_w
+    bboxes = tf.stack([x1, y1, x2, y2], axis=1)
+    
+    # Pad the bboxes, to make TF batching possible
+    is_crowd = _pad(is_crowd, MAX_PADDING_ROWS, pad_dtype=tf.bool)
+    labels = _pad(labels, MAX_PADDING_ROWS, pad_dtype=tf.int64)
+    bboxes = _pad(bboxes, MAX_PADDING_ROWS)
+
+    return {
+      "image": new_image, 
+      "size": [tf.cast(new_image_h, tf.int32), tf.cast(new_image_w, tf.int32), 
+               new_image_c],
+      "bbox_count": bbox_count,
+      "is_crowd": is_crowd,
+      "labels": labels,
+      "bbox": bboxes
+    }
 
   return _inner
 
@@ -60,10 +111,8 @@ def _resize_image(image, min_size=600, max_size=1000):
   maintaining the aspect ratio for the other side. If the greater side exceeds
   `max_size` after the initial resizing, the rescaling is done, such that the
   larger size is equal to `max_size`, which will mean that the shorter side
-  will be less than the `min_size`. Finally, the image is padded, such that
-  the final image will have dimensions of `max_size` x `max_size`. This approach
-  has the advantage that the aspect ratio is maintained, and that the objects
-  are not distorted.
+  will be less than the `min_size`. Finally, the image is padded on the right
+  and lower side, such that the final image will be `max_size` x `max_size`.
 
   Args:
     image: the image to be resized
@@ -71,14 +120,13 @@ def _resize_image(image, min_size=600, max_size=1000):
     max_size: the maximum size of the greater side, expressed in pixels
 
   Returns:
-    The rescaled and padded image.
+    The rescaled and padded image, together with the scaling ratio
   """
   shape = tf.shape(image)
   short_side = tf.minimum(shape[0], shape[1])
   large_side = tf.maximum(shape[0], shape[1])
 
   # Create the constants
-  two_constant = tf.constant(2, tf.int32)
   max_size_c_float = tf.constant(max_size, tf.float32)
 
   # Compute ratio such that image is not distorted, and is within bounds
@@ -92,11 +140,7 @@ def _resize_image(image, min_size=600, max_size=1000):
   image = tf.image.resize(image, [new_h, new_w])
 
   # Apply uniform padding on the image
-  max_size_c_int = tf.constant(max_size, tf.int32)
-  offset_h = tf.cast((max_size_c_int - new_h) / two_constant, tf.int32)
-  offset_w = tf.cast((max_size_c_int - new_w) / two_constant, tf.int32)
-  return tf.image.pad_to_bounding_box(image, offset_h, offset_w, max_size,
-                                      max_size)
+  return tf.image.pad_to_bounding_box(image, 0, 0, max_size, max_size), ratio
 
 
 def _standardize_resize(image, min_size=600, max_size=1000):
@@ -117,7 +161,7 @@ def _standardize_resize(image, min_size=600, max_size=1000):
   return _resize_image(image, min_size, max_size)
 
 
-def _standardize_resize_flip(image, min_size=600, max_size=1000):
+def _standardize_flip_resize(image, min_size=600, max_size=1000):
   """Applies a series of transformations to the input image.
 
   More specifically, this applies standardization, resizing, and then random
@@ -132,8 +176,9 @@ def _standardize_resize_flip(image, min_size=600, max_size=1000):
   Returns:
     The standardized, resized, and (possibly) flipped image
   """
-  image = _standardize_resize(image, min_size, max_size)
-  return tf.image.random_flip_left_right(image)
+  image = _standardize_image(image)
+  image = tf.image.random_flip_left_right(image)
+  return _resize_image(image, min_size, max_size)
 
 
 def read_data(prng_seed: int = 0):
@@ -201,14 +246,12 @@ def prepare_split(data, shape):
 
   def _helper(batch):
     batch = batch._numpy()
-    batch['image'] = tf.reshape(batch['image'], (device_count, -1) + shape)
-    batch['image/id'] = tf.reshape(batch['image/id'], (device_count, -1, 1))
-    batch['image/filename'] = tf.reshape(batch['image/filename'], (
-      device_count, -1, 1))
-    batch['objects'] = tf.reshape(batch['objects'], (device_count, -1, 1))
+    batch['image'] = jnp.reshape(batch['image'], (device_count, -1) + shape)
+    batch['size'] = jnp.reshape(batch['size'], (device_count, -1, 3))
+    batch['objects'] = jnp.reshape(batch['objects'], (device_count, -1, 1))
     return batch
 
-  return jax_utils.prefetch_to_device(itertools.cycle(map(_helper, data)), 2)
+  return map(_helper, data)
 
 
 def prepare_data(data, batch_size):
@@ -239,16 +282,20 @@ def prepare_data(data, batch_size):
 
   # Create wrapped pre-processing methods
   standardize_resize = preprocess_wrapper(_standardize_resize)
-  standardize_resize_flip = preprocess_wrapper(_standardize_resize_flip)
+  standardize_flip_resize = preprocess_wrapper(_standardize_flip_resize)
 
   # Prepare training data: standardize, resize and randomly flip the images
-  train = data["train"]["data"].shuffle(1000).map(
-    standardize_resize_flip, num_parallel_calls=autotune).batch(batch_size)
-  train = prepare_split(train, data["shape"])
+  train = data["train"]["data"].repeat().shuffle(batch_size * 16, seed=0).map(
+    standardize_resize_flip, num_parallel_calls=autotune)
+  train = prepare_split(train.batch(batch_size), data["shape"])
 
   # Prepare the test data: only standardize and resize
-  test = data["test"]["data"].map(
-    standardize_resize, num_parallel_calls=autotune).batch(batch_size),
-  test = prepare_split(test, data["shape"])
+  test = data["test"]["data"].map(standardize_resize, 
+                                  num_parallel_calls=autotune)
+  test = prepare_split(test.batch(batch_size), data["shape"])
 
   return train, test
+
+
+standardize_resize = preprocess_wrapper(_standardize_resize)
+standardize_flip_resize = preprocess_wrapper(_standardize_flip_resize)
