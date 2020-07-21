@@ -245,10 +245,20 @@ def prepare_split(data, shape):
   device_count = jax.device_count()
 
   def _helper(batch):
-    batch = batch._numpy()
+    # Convert the dataset to np array
+    batch = tfds.as_numpy(batch)
+
+    # Reshape the data such that it can be distributed to the devices 
     batch['image'] = jnp.reshape(batch['image'], (device_count, -1) + shape)
     batch['size'] = jnp.reshape(batch['size'], (device_count, -1, 3))
-    batch['objects'] = jnp.reshape(batch['objects'], (device_count, -1, 1))
+    batch['bbox_count'] = jnp.reshape(batch['bbox_count'], 
+                                      (device_count, -1, 1))
+    batch['is_crowd'] = jnp.reshape(batch['is_crowd'], 
+                                    (device_count, -1, MAX_PADDING_ROWS))
+    batch['labels'] = jnp.reshape(batch['labels'], 
+                                  (device_count, -1, MAX_PADDING_ROWS))
+    batch['bbox'] = jnp.reshape(batch['bbox'], 
+                                (device_count, -1, MAX_PADDING_ROWS, 4))
     return batch
 
   return map(_helper, data)
@@ -285,8 +295,8 @@ def prepare_data(data, batch_size):
   standardize_flip_resize = preprocess_wrapper(_standardize_flip_resize)
 
   # Prepare training data: standardize, resize and randomly flip the images
-  train = data["train"]["data"].repeat().shuffle(batch_size * 16, seed=0).map(
-    standardize_resize_flip, num_parallel_calls=autotune)
+  train = data["train"]["data"].repeat().shuffle(batch_size * 16, seed=1).map(
+    standardize_flip_resize, num_parallel_calls=autotune)
   train = prepare_split(train.batch(batch_size), data["shape"])
 
   # Prepare the test data: only standardize and resize
@@ -295,7 +305,3 @@ def prepare_data(data, batch_size):
   test = prepare_split(test.batch(batch_size), data["shape"])
 
   return train, test
-
-
-standardize_resize = preprocess_wrapper(_standardize_resize)
-standardize_flip_resize = preprocess_wrapper(_standardize_flip_resize)
