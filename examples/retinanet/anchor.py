@@ -113,8 +113,7 @@ def generate_all_anchors(shape, levels, strides, sizes, ratios, scales,
 
   # Compute the feature map sizes 
   shape = jnp.array(shape)
-  feature_maps = [(shape) // (2 ** level) for level in levels]
-  # feature_maps = [(shape + 2 ** level - 1) // (2 ** level) for level in levels]
+  feature_maps = [(shape + 2 ** level - 1) // (2 ** level) for level in levels]
 
   # Stack stack the anchors on axis 0: first levels[0], ..., levels[-1] 
   anchors = jnp.zeros((1, 0, 4), dtype=dtype)

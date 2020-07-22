@@ -155,19 +155,27 @@ class RetinaNet(flax.nn.Module):
     156: [3, 8, 36, 3]
   }
 
-  @staticmethod
-  @jax.jit
-  @jax.vmap
-  def _nn_upsample(a):
-    """This method does nearest neighbor single octave upsampling on the input
+  def _nn_upsample(a, shape):
+    """This method does nearest neighbor single octave upsampling on the input.
+
+    It also features a `shape` parameter, which will trim the height and 
+    width of the feature map to `shape`, if the original shape exceeds these
+    dimensions.
 
     Args:
       a: the array getting upsampled
+      shape: a list or tuple of the form [height, width, channels], indicating 
+        the maximal dimensions of the output.
 
     Returns:
-      The upsampled input
+      The upsampled input, having a shape at most equal to `shape` across each 
+      dimension.
     """
-    return jnp.repeat(a, 2, axis=0).repeat(2, axis=1)
+    upsampled = jnp.repeat(a, 2, axis=0).repeat(2, axis=1)
+    return jax.lax.dynamic_slice(upsampled, [0, 0, 0], 
+                                 [shape[0], shape[1], shape[2]])
+  nn_upsample = staticmethod(jax.vmap(_nn_upsample, in_axes=(0, None)))
+
 
   def _bottom_up_phase(self, data, train, base_features, layers, dtype):
     """Implements the backbone architecture.
@@ -257,9 +265,10 @@ class RetinaNet(flax.nn.Module):
 
     # Create the feature maps P4 and P3
     for i in [4, 3]:
-      upsampled = self._nn_upsample(fpn_features["P{}".format(i + 1)])
       lateral = conv(backbone_features["C{}".format(i)], kernel_size=(1, 1),
                      name="lateral_conv_p{}".format(i))
+      upsampled = self.nn_upsample(fpn_features["P{}".format(i + 1)], 
+                                    lateral.shape[1:])
       fpn_features["P{}".format(i)] = conv(
         upsampled + lateral, kernel_size=(3, 3),
         name="antialiasing_conv_p{}".format(i))

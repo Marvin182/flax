@@ -73,7 +73,7 @@ def create_model(rng, classes=1000, shape=(224, 224, 3), dtype=jnp.float32):
 
   # Since the BatchNorm has state, we'll need to use stateful here
   with flax.nn.stateful() as init_state:
-    _, params = partial_module.init(rng, jnp.zeros((2,) + shape))
+    _, params = partial_module.init(rng, jnp.zeros((1,) + shape))
 
   return flax.nn.Model(partial_module, params), init_state
 
