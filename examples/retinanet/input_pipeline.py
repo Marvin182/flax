@@ -7,107 +7,101 @@ import jax
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
-# These are constants relevant for the data preprocessing stage 
+# This controls the maximal number of bbox annotations in an image
 MAX_PADDING_ROWS = 100
 
-# These are the mean and std. dev of the COCO dataset
-# TODO: compute the actual mean and std dev of the MS COCO dataset
-COCO_MEAN = [0.485, 0.456, 0.406]
-COCO_STD =  [0.229, 0.224, 0.225]
 
-
-def _standardize_image(image):
-  """Standardizes the image values.
-
-  Standardizes the image values to mean 0 with standard deviation 1. This
-  function also normalizes the values prior to standardization.
-
-  Args:
-    image: the image to be standardized
-
-  Returns:
-    The standardized image
+class DataPreprocessor:
+  """This class handles data preprocessing for object detection tasks.
   """
-  image = tf.image.convert_image_dtype(image, tf.float32)
-  image -= tf.constant(COCO_MEAN, shape=[1, 1, 3])
-  image /= tf.constant(COCO_STD, shape=[1, 1, 3])
-  return image
 
+  def __init__(self, min_size=600, max_size=1000, mean=None, std_dev=None):
+    self.min_size = min_size
+    self.max_size = max_size
 
-def _resize_image(image, min_size=600, max_size=1000):
-  """Resizes and pads the image to `max_size` x `max_size`.
+    # If no mean and std deviation is provided, then reuse the ImageNet ones
+    self.mean = mean if mean is not None else [0.485, 0.456, 0.406]
+    self.std = std_dev if std_dev is not None else [0.229, 0.224, 0.225] 
 
-  The image is resized, such that its shorter size becomes `min_size`, while
-  maintaining the aspect ratio for the other side. If the greater side exceeds
-  `max_size` after the initial resizing, the rescaling is done, such that the
-  larger size is equal to `max_size`, which will mean that the shorter side
-  will be less than the `min_size`. Finally, the image is padded on the right
-  and lower side, such that the final image will be `max_size` x `max_size`.
+  def standardize_image(self, image):
+    """Standardizes the image values.
 
-  Args:
-    image: the image to be resized
-    min_size: the size of the shorter side, expressed in pixels
-    max_size: the maximum size of the greater side, expressed in pixels
+    Standardizes the image values to mean 0 with standard deviation 1. This
+    function also normalizes the values prior to standardization.
 
-  Returns:
-    The rescaled and padded image, together with the scaling ratio
-  """
-  shape = tf.shape(image)
-  short_side = tf.minimum(shape[0], shape[1])
-  large_side = tf.maximum(shape[0], shape[1])
+    Args:
+      image: the image to be standardized
 
-  # Create the constants
-  max_size_c_float = tf.constant(max_size, tf.float32)
+    Returns:
+      The standardized image
+    """
+    image = tf.image.convert_image_dtype(image, tf.float32)
+    image -= tf.constant(self.mean, shape=[1, 1, 3])
+    image /= tf.constant(self.std, shape=[1, 1, 3])
+    return image
 
-  # Compute ratio such that image is not distorted, and is within bounds
-  ratio = tf.constant(min_size, tf.float32) / tf.cast(short_side, tf.float32)
-  if tf.math.less(max_size_c_float, tf.cast(large_side, tf.float32) * ratio):
-    ratio = max_size_c_float / tf.cast(large_side, tf.float32)
+  def resize_image(self, image, min_size=600, max_size=1000):
+    """Resizes and pads the image to `max_size` x `max_size`.
 
-  # Compute the new dimensions, and apply them to the image
-  new_h = tf.cast(tf.cast(shape[0], tf.float32) * ratio, tf.int32)
-  new_w = tf.cast(tf.cast(shape[1], tf.float32) * ratio, tf.int32)
-  image = tf.image.resize(image, [new_h, new_w])
+    The image is resized, such that its shorter size becomes `min_size`, while
+    maintaining the aspect ratio for the other side. If the greater side exceeds
+    `max_size` after the initial resizing, the rescaling is done, such that the
+    larger size is equal to `max_size`, which will mean that the shorter side
+    will be less than the `min_size`. Finally, the image is padded on the right
+    and lower side, such that the final image will be `max_size` x `max_size`.
 
-  # Apply uniform padding on the image
-  return tf.image.pad_to_bounding_box(image, 0, 0, max_size, max_size), ratio
+    Args:
+      image: the image to be resized
 
+    Returns:
+      The rescaled and padded image, together with the scaling ratio
+    """
+    shape = tf.shape(image)
+    short_side = tf.minimum(shape[0], shape[1])
+    large_side = tf.maximum(shape[0], shape[1])
 
-def _standardize_resize(image, min_size=600, max_size=1000):
-  """Applies a series of transformations to the input image.
+    # Create the constants
+    max_size_c_float = tf.constant(self.max_size, tf.float32)
 
-  More specifically, this applies standardization and resizing. The output 
-  size of the image is `max_size` x `max_size`.
+    # Compute ratio such that image is not distorted, and is within bounds
+    ratio = tf.constant(self.min_size, tf.float32) / tf.cast(short_side, 
+                                                             tf.float32)
+    if tf.math.less(max_size_c_float, tf.cast(large_side, tf.float32) * ratio):
+      ratio = max_size_c_float / tf.cast(large_side, tf.float32)
 
-  Args:
-    image: the image to be processed
-    min_size: the size of the shorter side, expressed in pixels
-    max_size: the maximum size of the greater side, expressed in pixels
+    # Compute the new dimensions, and apply them to the image
+    new_h = tf.cast(tf.cast(shape[0], tf.float32) * ratio, tf.int32)
+    new_w = tf.cast(tf.cast(shape[1], tf.float32) * ratio, tf.int32)
+    image = tf.image.resize(image, [new_h, new_w])
 
-  Returns:
-    The standardized and resized image
-  """
-  image = _standardize_image(image)
-  return _resize_image(image, min_size, max_size)
+    # Apply uniform padding on the image
+    return tf.image.pad_to_bounding_box(
+      image, 0, 0, self.max_size, self.max_size), ratio
 
+  @staticmethod
+  def augment_image(image, bboxes):
+    """This applies data augmentation on the image and its associated bboxes.
 
-def preprocess_wrapper(func, flip_image=False):
-  """Wraps `func`, such that the COCO data format is maintained.
+    Currently, the image only applies horizontal flipping to the image and 
+    its ground truth bboxes. 
 
-  More specifically, it allows `func` to only implement logic for processing
-  images, without having to deal with the logic of unpacking or rescaling 
-  the bboxes. 
+    Args:
+      image: the image to be augmented
+      bboxes: a 2D tensor, which stores the coordinates of the ground truth 
+        bounding boxes 
 
-  Args:
-    func: a function which takes a single unnamed parameter - the image -,
-      processes it and returns it, and the new scale of the image.
-    flip_image: a flag which indicates whether to randomly flip the image and
-      associated anchors
+    Returns:
+      A tuple consisting of the transformed image and bboxes.
+    """
+    ## BBoxes should be normalized, and have the structure: [y1, x1, y2, x2]
+    image = tf.image.flip_left_right(image)
+    bboxes = tf.map_fn(
+      lambda x: tf.convert_to_tensor([x[0], 1.0 - x[1], x[2], 1.0 - x[3]], 
+      dtype=tf.float32), bboxes)
+    return image, bboxes
 
-  Returns:
-    A function which can be passed a COCO data dictionary as produced by TFDS
-  """
-  def _pad(data, output_rows, dtype=tf.float32):
+  @staticmethod
+  def pad(data, output_rows, dtype=tf.float32):
     """Adds extra rows to the data. 
 
     Args:
@@ -124,55 +118,85 @@ def preprocess_wrapper(func, flip_image=False):
     padding = tf.zeros(padding_shape, dtype=dtype)
     return tf.concat([data, padding], axis=0)
 
-  def _augment(image, bboxes):
-    ## BBoxes should be normalized, and have the structure: [y1, x1, y2, x2]
-    image = tf.image.flip_left_right(image)
-    bboxes = tf.map_fn(
-      lambda x: tf.convert_to_tensor([x[0], 1.0 - x[1], x[2], 1.0 - x[3]], 
-      dtype=tf.float32), bboxes)
-    return image, bboxes
+  def __call__(self, augment_image=False, augment_probability=0.5):
+    """Creates a TF compatible function which can be used to preprocess batches. 
 
-  def _inner(data):
-    # Unpack the dataset elements
-    image = data["image"]
-    is_crowd = data["objects"]["is_crowd"]
-    labels = data["objects"]["label"]
-    bboxes = data["objects"]["bbox"]
-    bbox_count = tf.shape(bboxes)[0]
+    The generated function will unpack an object detection dataset, as returned
+    by TFDS, preprocess it by standardizing and rescaling the image to 
+    a given size, while also maintaining its aspect ratio using padding. If 
+    the `augment_image` is `True`, then the image will be augmented with 
+    `augment_probability` likelihood. The initial data, is expected to be a 
+    TFDS FeaturesDict, which has minimally the following structure:
 
-    if flip_image and tf.random.uniform([], minval=0.0, maxval=1.0) >= 0.5:
-        image, bboxes = _augment(image, bboxes)
+    ```
+      {
+      'image': Image(shape=(None, None, 3), dtype=tf.uint8),
+      'objects': Sequence({
+          'area': tf.int64,
+          'bbox': BBoxFeature(shape=(4,), dtype=tf.float32),
+          'id': tf.int64,
+          'is_crowd': tf.bool,
+          'label': ClassLabel(shape=(), dtype=tf.int64),
+      }
+    ```
 
-    # Preprocess the image, and compute the size of the new image
-    new_image, ratio = func(image)
-    original_image_size = tf.cast(tf.shape(image), tf.float32)
-    new_image_h = original_image_size[0] * ratio
-    new_image_w = original_image_size[1] * ratio
-    new_image_c = tf.cast(original_image_size[2], tf.int32)
+    Args:
+      augment_image: a flag which indicates whether to randomly augment 
+        the image and its associated anchors
+      augment_probability: the probability with which to perform augmentation
+        if `augment_image` is True
 
-    # Invert the x's and y's, to make access more intuitive
-    y1 = bboxes[:, 0] * new_image_h
-    x1 = bboxes[:, 1] * new_image_w
-    y2 = bboxes[:, 2] * new_image_h
-    x2 = bboxes[:, 3] * new_image_w
-    bboxes = tf.stack([x1, y1, x2, y2], axis=1)
-    
-    # Pad the bboxes, to make TF batching possible
-    is_crowd = _pad(is_crowd, MAX_PADDING_ROWS, dtype=tf.bool)
-    labels = _pad(labels, MAX_PADDING_ROWS, dtype=tf.int64)
-    bboxes = _pad(bboxes, MAX_PADDING_ROWS)
+    Returns:
+      [TODO]: explain what the structure of the output will be like
+    """
+    assert 0.0 <= augment_probability <= 1.0, "augment_probability must be " \
+                                              "in the range [0.0, 1.0]"
 
-    return {
-      "image": new_image, 
-      "size": [tf.cast(new_image_h, tf.int32), tf.cast(new_image_w, tf.int32), 
-               new_image_c],
-      "bbox_count": bbox_count,
-      "is_crowd": is_crowd,
-      "labels": labels,
-      "bbox": bboxes
-    }
+    def _inner(data):
+      # Unpack the dataset elements
+      image = data["image"]
+      is_crowd = data["objects"]["is_crowd"]
+      labels = data["objects"]["label"]
+      bboxes = data["objects"]["bbox"]
+      bbox_count = tf.shape(bboxes)[0]
 
-  return _inner
+      if augment_image and tf.random.uniform(
+        [], minval=0.0, maxval=1.0) >= augment_probability:
+        image, bboxes = self.augment_image(image, bboxes)
+
+      # Preprocess the image, and compute the size of the new image
+      image = self.standardize_image(image)
+      new_image, ratio = self.resize_image(image)
+      original_image_size = tf.cast(tf.shape(image), tf.float32)
+      new_image_h = original_image_size[0] * ratio
+      new_image_w = original_image_size[1] * ratio
+      new_image_c = tf.cast(original_image_size[2], tf.int32)
+
+      # Invert the x's and y's, to make access more intuitive
+      y1 = bboxes[:, 0] * new_image_h
+      x1 = bboxes[:, 1] * new_image_w
+      y2 = bboxes[:, 2] * new_image_h
+      x2 = bboxes[:, 3] * new_image_w
+      bboxes = tf.stack([x1, y1, x2, y2], axis=1)
+      
+      # Pad the bboxes, to make TF batching possible
+      is_crowd = self.pad(is_crowd, MAX_PADDING_ROWS, dtype=tf.bool)
+      labels = self.pad(labels, MAX_PADDING_ROWS, dtype=tf.int64)
+      bboxes = self.pad(bboxes, MAX_PADDING_ROWS)
+
+      # Perform anchor specific operations: anchor filtering, IoU, and labelling
+
+      # Return the preprocessed batch
+      return {
+        "image": new_image, 
+        "size": [tf.cast(new_image_h, tf.int32), tf.cast(new_image_w, tf.int32), 
+                new_image_c],
+        "bbox_count": bbox_count,
+        "is_crowd": is_crowd,
+        "labels": labels,
+        "bbox": bboxes
+      }
+    return _inner
 
 
 def read_data(prng_seed: int = 0):
@@ -285,17 +309,15 @@ def prepare_data(data, batch_size):
   autotune = tf.data.experimental.AUTOTUNE
 
   # Create wrapped pre-processing methods
-  standardize_resize = preprocess_wrapper(_standardize_resize)
-  standardize_resize_flip = preprocess_wrapper(_standardize_resize, 
-                                               flip_image=True)
+  batch_preprocessor = DataPreprocessor()
 
   # Prepare training data: standardize, resize and randomly flip the images
   train = data["train"]["data"].repeat().shuffle(batch_size * 16, seed=1).map(
-    standardize_resize_flip, num_parallel_calls=autotune)
+    batch_preprocessor(augment_image=True), num_parallel_calls=autotune)
   train = prepare_split(train.batch(batch_size), data["shape"])
 
   # Prepare the test data: only standardize and resize
-  test = data["test"]["data"].map(standardize_resize, 
+  test = data["test"]["data"].map(batch_preprocessor(), 
                                   num_parallel_calls=autotune)
   test = prepare_split(test.batch(batch_size), data["shape"])
 
