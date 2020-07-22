@@ -16,76 +16,6 @@ COCO_MEAN = [0.485, 0.456, 0.406]
 COCO_STD =  [0.229, 0.224, 0.225]
 
 
-def preprocess_wrapper(func):
-  """Which wraps `func`, such that the COCO data format is maintained.
-
-  More specifically, it allows `func` to only implement logic for processing
-  images, without having to deal with the logic of unpacking or rescaling 
-  the bboxes. 
-
-  Args:
-    func: a function which takes a single unnamed parameter - the image -,
-      processes it and returns it, and the new scale of the image.
-
-  Returns:
-    A function which can be passed a COCO data dictionary as produced by TFDS
-  """
-  def _pad(data, output_rows, pad_dtype=tf.float32):
-    """Adds extra rows to the data. 
-
-    Args:
-      data: a 1D or 2D dataset to be padded
-      output_rows: a scalar indicating the number of rows of the padded data
-      pad_dtype: the TF dtype used for padding
-
-    Returns:
-      The padded data
-    """
-    data_shape = tf.shape(data)
-    to_pad = tf.math.maximum(0, output_rows - data_shape[0])
-    padding_shape = [to_pad, data_shape[1]] if len(data_shape) == 2 else to_pad
-    padding = tf.zeros(padding_shape, dtype=pad_dtype)
-    return tf.concat([data, padding], axis=0)
-
-  def _inner(data):
-    # Preprocess the image, and compute the size of the new image
-    new_image, ratio = func(data["image"])
-    original_image_size = tf.cast(tf.shape(data["image"]), tf.float32)
-    new_image_h = original_image_size[0] * ratio
-    new_image_w = original_image_size[1] * ratio
-    new_image_c = tf.cast(original_image_size[2], tf.int32)
-
-    # Unpack and de-normalize the bboxes
-    is_crowd = data["objects"]["is_crowd"]
-    labels = data["objects"]["label"]
-    bboxes = data["objects"]["bbox"]
-    bbox_count = tf.shape(bboxes)[0]
-
-    # Invert the x's and y's, to make access more intuitive
-    y1 = bboxes[:, 0] * new_image_h
-    x1 = bboxes[:, 1] * new_image_w
-    y2 = bboxes[:, 2] * new_image_h
-    x2 = bboxes[:, 3] * new_image_w
-    bboxes = tf.stack([x1, y1, x2, y2], axis=1)
-    
-    # Pad the bboxes, to make TF batching possible
-    is_crowd = _pad(is_crowd, MAX_PADDING_ROWS, pad_dtype=tf.bool)
-    labels = _pad(labels, MAX_PADDING_ROWS, pad_dtype=tf.int64)
-    bboxes = _pad(bboxes, MAX_PADDING_ROWS)
-
-    return {
-      "image": new_image, 
-      "size": [tf.cast(new_image_h, tf.int32), tf.cast(new_image_w, tf.int32), 
-               new_image_c],
-      "bbox_count": bbox_count,
-      "is_crowd": is_crowd,
-      "labels": labels,
-      "bbox": bboxes
-    }
-
-  return _inner
-
-
 def _standardize_image(image):
   """Standardizes the image values.
 
@@ -146,7 +76,7 @@ def _resize_image(image, min_size=600, max_size=1000):
 def _standardize_resize(image, min_size=600, max_size=1000):
   """Applies a series of transformations to the input image.
 
-  More specifically, this applies standardization and resizing. The output
+  More specifically, this applies standardization and resizing. The output 
   size of the image is `max_size` x `max_size`.
 
   Args:
@@ -161,24 +91,88 @@ def _standardize_resize(image, min_size=600, max_size=1000):
   return _resize_image(image, min_size, max_size)
 
 
-def _standardize_flip_resize(image, min_size=600, max_size=1000):
-  """Applies a series of transformations to the input image.
+def preprocess_wrapper(func, flip_image=False):
+  """Wraps `func`, such that the COCO data format is maintained.
 
-  More specifically, this applies standardization, resizing, and then random
-  horizontal image flipping. The output size of the image is `max_size` x
-  `max_size`.
+  More specifically, it allows `func` to only implement logic for processing
+  images, without having to deal with the logic of unpacking or rescaling 
+  the bboxes. 
 
   Args:
-    image: the image to be processed
-    min_size: the size of the shorter side, expressed in pixels
-    max_size: the maximum size of the greater side, expressed in pixels
+    func: a function which takes a single unnamed parameter - the image -,
+      processes it and returns it, and the new scale of the image.
+    flip_image: a flag which indicates whether to randomly flip the image and
+      associated anchors
 
   Returns:
-    The standardized, resized, and (possibly) flipped image
+    A function which can be passed a COCO data dictionary as produced by TFDS
   """
-  image = _standardize_image(image)
-  image = tf.image.random_flip_left_right(image)
-  return _resize_image(image, min_size, max_size)
+  def _pad(data, output_rows, dtype=tf.float32):
+    """Adds extra rows to the data. 
+
+    Args:
+      data: a 1D or 2D dataset to be padded
+      output_rows: a scalar indicating the number of rows of the padded data
+      dtype: the TF dtype used for padding
+
+    Returns:
+      The padded data
+    """
+    data_shape = tf.shape(data)
+    to_pad = tf.math.maximum(0, output_rows - data_shape[0])
+    padding_shape = [to_pad, data_shape[1]] if len(data_shape) == 2 else to_pad
+    padding = tf.zeros(padding_shape, dtype=dtype)
+    return tf.concat([data, padding], axis=0)
+
+  def _augment(image, bboxes):
+    ## BBoxes should be normalized, and have the structure: [y1, x1, y2, x2]
+    image = tf.image.flip_left_right(image)
+    bboxes = tf.map_fn(
+      lambda x: tf.convert_to_tensor([x[0], 1.0 - x[1], x[2], 1.0 - x[3]], 
+      dtype=tf.float32), bboxes)
+    return image, bboxes
+
+  def _inner(data):
+    # Unpack the dataset elements
+    image = data["image"]
+    is_crowd = data["objects"]["is_crowd"]
+    labels = data["objects"]["label"]
+    bboxes = data["objects"]["bbox"]
+    bbox_count = tf.shape(bboxes)[0]
+
+    if flip_image and tf.random.uniform([], minval=0.0, maxval=1.0) >= 0.5:
+        image, bboxes = _augment(image, bboxes)
+
+    # Preprocess the image, and compute the size of the new image
+    new_image, ratio = func(image)
+    original_image_size = tf.cast(tf.shape(image), tf.float32)
+    new_image_h = original_image_size[0] * ratio
+    new_image_w = original_image_size[1] * ratio
+    new_image_c = tf.cast(original_image_size[2], tf.int32)
+
+    # Invert the x's and y's, to make access more intuitive
+    y1 = bboxes[:, 0] * new_image_h
+    x1 = bboxes[:, 1] * new_image_w
+    y2 = bboxes[:, 2] * new_image_h
+    x2 = bboxes[:, 3] * new_image_w
+    bboxes = tf.stack([x1, y1, x2, y2], axis=1)
+    
+    # Pad the bboxes, to make TF batching possible
+    is_crowd = _pad(is_crowd, MAX_PADDING_ROWS, dtype=tf.bool)
+    labels = _pad(labels, MAX_PADDING_ROWS, dtype=tf.int64)
+    bboxes = _pad(bboxes, MAX_PADDING_ROWS)
+
+    return {
+      "image": new_image, 
+      "size": [tf.cast(new_image_h, tf.int32), tf.cast(new_image_w, tf.int32), 
+               new_image_c],
+      "bbox_count": bbox_count,
+      "is_crowd": is_crowd,
+      "labels": labels,
+      "bbox": bboxes
+    }
+
+  return _inner
 
 
 def read_data(prng_seed: int = 0):
@@ -292,11 +286,12 @@ def prepare_data(data, batch_size):
 
   # Create wrapped pre-processing methods
   standardize_resize = preprocess_wrapper(_standardize_resize)
-  standardize_flip_resize = preprocess_wrapper(_standardize_flip_resize)
+  standardize_resize_flip = preprocess_wrapper(_standardize_resize, 
+                                               flip_image=True)
 
   # Prepare training data: standardize, resize and randomly flip the images
   train = data["train"]["data"].repeat().shuffle(batch_size * 16, seed=1).map(
-    standardize_flip_resize, num_parallel_calls=autotune)
+    standardize_resize_flip, num_parallel_calls=autotune)
   train = prepare_split(train.batch(batch_size), data["shape"])
 
   # Prepare the test data: only standardize and resize

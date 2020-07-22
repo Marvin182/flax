@@ -1,4 +1,3 @@
-from dataclasses import dataclass, field
 from jax import numpy as jnp
 
 
@@ -59,18 +58,3 @@ def jaccard_index(rect1, rect2):
 
   # Return the IoU
   return intersection / union
-
-
-@dataclass
-class AnchorConfig:
-  """This class contains the necessary information for unpacking anchors.
-
-  It should be mentioned that the length of `sizes` and `strides` must be equal
-  to the number of layers in RetinaNet's head. `scales` and `ratios` are lists
-  of arbitrary lengths.
-  """
-  sizes : list = field(default_factory=lambda: [32, 64, 128, 256, 512])
-  strides : list = field(default_factory=lambda: [8, 16, 32, 64, 128])
-  ratios : list = field(default_factory=lambda: [0.5, 1, 2])
-  scales : list = field(default_factory=lambda: [1.0, 2.0 ** (1.0 / 3.0),
-                                                 2.0 ** (2.0 / 3.0)])
