@@ -1,6 +1,8 @@
+from anchor import generate_all_anchors, AnchorConfig 
 from flax import jax_utils
 from jax import numpy as jnp
 from os import getenv
+from util import tf_jaccard_index
 
 import itertools
 import jax
@@ -15,13 +17,28 @@ class DataPreprocessor:
   """This class handles data preprocessing for object detection tasks.
   """
 
-  def __init__(self, min_size=600, max_size=1000, mean=None, std_dev=None):
+  def __init__(self, min_size=600, max_size=1000, mean=None, std_dev=None, 
+               anchor_config : AnchorConfig = None):
+    assert min_size > 0 and max_size > 0 and min_size <= max_size, \
+      "The following requirement is violated: 0 < min_size <= max_size"
+
     self.min_size = min_size
     self.max_size = max_size
 
     # If no mean and std deviation is provided, then reuse the ImageNet ones
     self.mean = mean if mean is not None else [0.485, 0.456, 0.406]
     self.std = std_dev if std_dev is not None else [0.229, 0.224, 0.225] 
+
+    # Generate all anchors for a `max_size` x `max_size` image
+    if anchor_config is None:
+      anchor_config = AnchorConfig()
+
+    self.all_anchors = generate_all_anchors(
+      (max_size, max_size), anchor_config.levels, anchor_config.strides, 
+      anchor_config.sizes, anchor_config.ratios, anchor_config.scales)
+    
+    # Convert to tensor for the rest of the preprocessing
+    self.all_anchors = tf.convert_to_tensor(self.all_anchors)
 
   def standardize_image(self, image):
     """Standardizes the image values.
@@ -118,6 +135,78 @@ class DataPreprocessor:
     padding = tf.zeros(padding_shape, dtype=dtype)
     return tf.concat([data, padding], axis=0)
 
+  @staticmethod
+  def filter_outer_anchors(anchors : tf.Tensor, shape : tf.Tensor) -> tf.Tensor:
+    """Get the indexes of the anchors inside the `shape` rectangle.
+
+    Args:
+      anchors: a matrix of anchors with shape (-1, 4)
+      shape: a list or tuple with the shape [height, width], which defines 
+        the rectangle having coordinates: (0, 0) and (width, height) respectively
+  
+    Returns:
+      A column vector, with True in the positions where the anchor lies within 
+      the rectangle, and False otherwise
+    """
+    two = tf.constant(2.0, dtype=tf.float32)
+    mid_x = (anchors[:, 0] + anchors[:, 2]) / two
+    mid_y = (anchors[:, 1] + anchors[:, 3]) / two
+    centers = tf.transpose(tf.stack([mid_x, mid_y]))
+    
+    # We are guaranteed to have the centers >= 0: check only upper bounds 
+    in_anchors = tf.math.logical_and(centers[:, 0] < shape[1], 
+                                     centers[:, 1] < shape[0])
+    return tf.boolean_mask(tf.range(0, tf.shape(anchors)[0]), in_anchors)  
+     
+
+  @staticmethod
+  def compute_anchor_overlaps(anchors : tf.Tensor, bboxes : tf.Tensor):
+    """Computes the IoU of each anchor against each bbox.
+
+    Given an (|A|, 4) matrix for the anchors, and a (|B|, 4) matrix for the 
+    bboxes, this method will output an (|A|, |B|) matrix, where each entry
+    (i, j) stores the IoU of anchor `i` and bbox `j`. 
+
+    Args:
+      anchors: an (|A|, 4) matrix for the anchors.
+      bboxes: a (|B|, 4) matrix for the bboxes.
+
+    Returns:
+      An (|A|, |B|) matrix, where each entry stores the IoU of an anchor and 
+      a bbox.
+    """
+    bbox_count = tf.shape(bboxes)[0]
+    anchor_count = tf.shape(anchors)[0]
+
+    # Compute the Cartesian Product between the anchors and the bboxes 
+    repeats = tf.ones(anchor_count, dtype=tf.int32) * bbox_count
+    anchors = tf.repeat(anchors, repeats, axis=0)
+    bboxes = tf.tile(bboxes, [anchor_count, 1])
+    
+    # Compute the overlaps
+    overlaps = tf.map_fn(tf_jaccard_index, (anchors, bboxes), dtype=tf.float32)
+    return tf.reshape(overlaps, [anchor_count, bbox_count])
+
+  @staticmethod
+  def compute_labels(overlaps, foreground_threshold=0.5, ignore_threshold=0.4):
+    # Get the max overlap value for each of the anchors
+    row_idxs = tf.range(0, tf.shape(overlaps)[0], dtype=tf.int64)
+    argmax = tf.argmax(overlaps, axis=1)
+    indexes = tf.stack([row_idxs, argmax], axis=1)
+    max_overlaps = tf.gather_nd(overlaps, indexes)
+    
+    # Get the indexes of the foreground anchors
+    lower = tf.math.greater_equal(max_overlaps, foreground_threshold)
+    foreground = tf.boolean_mask(row_idxs, lower)
+
+    # Get the indexes of the ignored anchors
+    lower = tf.math.greater_equal(max_overlaps, ignore_threshold)
+    upper = tf.math.less(max_overlaps, foreground_threshold)
+    in_range = tf.math.logical_and(lower, upper)
+    ignored = tf.boolean_mask(row_idxs, in_range) 
+
+    return foreground, ignored
+
   def __call__(self, augment_image=False, augment_probability=0.5):
     """Creates a TF compatible function which can be used to preprocess batches. 
 
@@ -178,13 +267,18 @@ class DataPreprocessor:
       y2 = bboxes[:, 2] * new_image_h
       x2 = bboxes[:, 3] * new_image_w
       bboxes = tf.stack([x1, y1, x2, y2], axis=1)
+
+      # Perform anchor specific operations: filtering, IoU, and labelling
+      anchors = tf.identity(self.all_anchors)
+      in_idx = self.filter_outer_anchors(anchors, [new_image_h, new_image_w])
+      in_anchors = tf.gather(anchors, in_idx)
+      overlaps = self.compute_anchor_overlaps(in_anchors, bboxes)
+      foreground, ignored = self.compute_labels(overlaps)
       
       # Pad the bboxes, to make TF batching possible
       is_crowd = self.pad(is_crowd, MAX_PADDING_ROWS, dtype=tf.bool)
       labels = self.pad(labels, MAX_PADDING_ROWS, dtype=tf.int64)
       bboxes = self.pad(bboxes, MAX_PADDING_ROWS)
-
-      # Perform anchor specific operations: anchor filtering, IoU, and labelling
 
       # Return the preprocessed batch
       return {
@@ -194,7 +288,10 @@ class DataPreprocessor:
         "bbox_count": bbox_count,
         "is_crowd": is_crowd,
         "labels": labels,
-        "bbox": bboxes
+        "bbox": bboxes,
+        "overlaps": overlaps,
+        "foreground": foreground,
+        "ignored": ignored
       }
     return _inner
 
@@ -277,6 +374,16 @@ def prepare_split(data, shape):
                                   (device_count, -1, MAX_PADDING_ROWS))
     batch['bbox'] = jnp.reshape(batch['bbox'], 
                                 (device_count, -1, MAX_PADDING_ROWS, 4))
+
+    # FIXME: This might need to be removed, since it's just for debug 
+    print("Original ignored shape:", batch['ignored'].shape)
+    print("Original foreground shape:", batch['foreground'].shape)
+    batch['overlaps'] = jnp.reshape(
+      batch['overlaps'], (device_count, -1, batch['overlaps'].shape[-2], batch['overlaps'].shape[-1]))    
+    batch['ignored'] = jnp.reshape(
+      batch['ignored'], (device_count, -1, batch['ignored'].shape[0]))
+    batch['foreground'] = jnp.reshape(
+      batch['foreground'], (device_count, -1, batch['foreground'].shape[0]))
     return batch
 
   return map(_helper, data)
@@ -312,7 +419,7 @@ def prepare_data(data, batch_size):
   batch_preprocessor = DataPreprocessor()
 
   # Prepare training data: standardize, resize and randomly flip the images
-  train = data["train"]["data"].repeat().shuffle(batch_size * 16, seed=1).map(
+  train = data["train"]["data"].repeat().shuffle(batch_size * 16, seed=0).map(
     batch_preprocessor(augment_image=True), num_parallel_calls=autotune)
   train = prepare_split(train.batch(batch_size), data["shape"])
 

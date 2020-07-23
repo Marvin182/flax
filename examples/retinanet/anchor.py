@@ -12,6 +12,7 @@ class AnchorConfig:
   to the number of layers in RetinaNet's head. `scales` and `ratios` are lists
   of arbitrary lengths.
   """
+  levels : list = field(default_factory=lambda: [3, 4, 5, 6, 7])
   sizes : list = field(default_factory=lambda: [32, 64, 128, 256, 512])
   strides : list = field(default_factory=lambda: [8, 16, 32, 64, 128])
   ratios : list = field(default_factory=lambda: [0.5, 1, 2])
@@ -125,6 +126,30 @@ def generate_all_anchors(shape, levels, strides, sizes, ratios, scales,
   anchors = anchors[0, :, :]
   extra_zeros = jnp.zeros((anchors.shape[0], 1), dtype=dtype)
   return jnp.concatenate((anchors, extra_zeros), axis=1)
+
+
+# def filter_outer_anchors(anchors, shape):
+#   """Get the indexes of the anchors inside the `shape` rectangle.
+
+#   Args:
+#     anchors: a matrix of anchors with shape (-1, 4)
+#     shape: a list or tuple with the shape [height, width], which defines 
+#       the rectangle having coordinates: (0, 0) and (width, height) respectively
+ 
+#   Returns:
+#     A column vector, with True in the positions where the anchor lies within 
+#     the rectangle, and False otherwise
+#   """
+#   # def _inner(x):
+#   #   mid_x = (x[2] - x[0]) / 2
+#   #   mid_y = (x[3] - x[0]) / 2
+#   #   return 0 <= mid_x <= shape[1] and 0 <= mid_y <= shape[0]
+
+#   mid_x = (anchors[:, 2] - anchors[:, 0]) / 2
+#   mid_y = (anchors[:, 3] - anchors[:, 1]) / 2
+#   mid_x = jnp.all([0 <= mid_x[:], mid_x[:] <= 1])
+  
+#   return mid_x
 
 
 class AnchorUnpacker(flax.nn.Module):
