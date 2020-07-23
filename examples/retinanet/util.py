@@ -1,5 +1,6 @@
 from jax import numpy as jnp
 
+import tensorflow as tf
 
 def pi_init(pi):
   """Wrapper to log-based weight initializer function.
@@ -58,3 +59,31 @@ def jaccard_index(rect1, rect2):
 
   # Return the IoU
   return intersection / union
+
+
+@tf.function
+def tf_jaccard_index(rects):
+  rect1 = rects[0]
+  rect2 = rects[1]
+
+  # Compute the overlap on the X axis
+  left_x = tf.math.maximum(rect1[0], rect2[0])
+  right_x = tf.math.minimum(rect1[2], rect2[2])
+  overlap_x = tf.math.maximum(0.0, right_x - left_x)
+
+  # Compute the overlap on the Y axis
+  lo_y = tf.math.maximum(rect1[1], rect2[1])
+  hi_y = tf.math.minimum(rect1[3], rect2[3])
+  overlap_y = tf.math.maximum(0.0, hi_y - lo_y)
+
+  # Compute the area of the intersection
+  intersection = overlap_x * overlap_y
+
+  # Compute the area of the union
+  area1 = (rect1[2] - rect1[0]) * (rect1[3] - rect1[1])
+  area2 = (rect2[2] - rect2[0]) * (rect2[3] - rect2[1])
+  union = area1 + area2 - intersection
+
+  # Return the IoU
+  return intersection / union
+
