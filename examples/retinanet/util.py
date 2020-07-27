@@ -62,7 +62,7 @@ def jaccard_index(rect1, rect2):
 
 
 @tf.function
-def tf_jaccard_index(rects):
+def tf_jaccard_index(rects : tf.Tensor):
   rect1 = rects[0]
   rect2 = rects[1]
 
@@ -86,4 +86,16 @@ def tf_jaccard_index(rects):
 
   # Return the IoU
   return intersection / union
+
+
+@tf.function
+def tf_compute_regression_targets(rects : tf.Tensor, mean : tf.Tensor = None, 
+                                  std_dev : tf.Tensor = None):
+  if mean is None:
+    mean = tf.constant([0.0, 0.0, 0.0, 0.0], dtype=tf.float32)
+
+  if std_dev is None:
+    std_dev = tf.constant([0.2, 0.2, 0.2, 0.2], dtype=tf.float32)
+
+  
 
