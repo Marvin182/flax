@@ -137,16 +137,16 @@ class DataPreprocessor:
 
   @staticmethod
   def filter_outer_anchors(anchors : tf.Tensor, shape : tf.Tensor) -> tf.Tensor:
-    """Get the indexes of the anchors inside the `shape` rectangle.
+    """Get the indexes of the anchors inside and outside the `shape` rectangle.
 
     Args:
       anchors: a matrix of anchors with shape (-1, 4)
       shape: a list or tuple with the shape [height, width], which defines 
-        the rectangle having coordinates: (0, 0) and (width, height) respectively
+        the rectangle having coordinates: (0, 0) and (width, height)
   
     Returns:
-      A column vector, with True in the positions where the anchor lies within 
-      the rectangle, and False otherwise
+      Two column vectors, with the indexes into `anchors` of the anchors which
+      fall inside `shape`, and those which do not, respecitvely 
     """
     two = tf.constant(2.0, dtype=tf.float32)
     mid_x = (anchors[:, 0] + anchors[:, 2]) / two
@@ -156,8 +156,14 @@ class DataPreprocessor:
     # We are guaranteed to have the centers >= 0: check only upper bounds 
     in_anchors = tf.math.logical_and(centers[:, 0] < shape[1], 
                                      centers[:, 1] < shape[0])
-    return tf.boolean_mask(tf.range(0, tf.shape(anchors)[0]), in_anchors)  
-     
+    out_anchors = tf.math.logical_not(in_anchors)
+
+    # Get the indexes of the inner and outer anchors
+    row_idxs = tf.range(tf.shape(anchors)[0])
+    in_idx = tf.boolean_mask(row_idxs, in_anchors)  
+    out_idx = tf.boolean_mask(row_idxs, out_anchors)  
+
+    return in_idx, out_idx 
 
   @staticmethod
   def compute_anchor_overlaps(anchors : tf.Tensor, bboxes : tf.Tensor):
@@ -188,24 +194,114 @@ class DataPreprocessor:
     return tf.reshape(overlaps, [anchor_count, bbox_count])
 
   @staticmethod
-  def compute_labels(overlaps, foreground_threshold=0.5, ignore_threshold=0.4):
+  def compute_foreground_ignored(overlaps : tf.Tensor, 
+                                 foreground_t : float = 0.5, 
+                                 ignore_t : float = 0.4):
+    assert foreground_t > 0 and ignore_t > 0 and ignore_t <= foreground_t, \
+      "The following requirement is violated: 0 < ignore_t <= foreground_t"
+
     # Get the max overlap value for each of the anchors
-    row_idxs = tf.range(0, tf.shape(overlaps)[0], dtype=tf.int64)
-    argmax = tf.argmax(overlaps, axis=1)
+    row_idxs = tf.range(tf.shape(overlaps)[0], dtype=tf.int32)
+    argmax = tf.argmax(overlaps, axis=1, output_type=tf.int32)
     indexes = tf.stack([row_idxs, argmax], axis=1)
     max_overlaps = tf.gather_nd(overlaps, indexes)
     
     # Get the indexes of the foreground anchors
-    lower = tf.math.greater_equal(max_overlaps, foreground_threshold)
-    foreground = tf.boolean_mask(row_idxs, lower)
+    lower = tf.math.greater_equal(max_overlaps, foreground_t)
+    foreground_idx = tf.boolean_mask(row_idxs, lower)
 
     # Get the indexes of the ignored anchors
-    lower = tf.math.greater_equal(max_overlaps, ignore_threshold)
-    upper = tf.math.less(max_overlaps, foreground_threshold)
+    lower = tf.math.greater_equal(max_overlaps, ignore_t)
+    upper = tf.math.less(max_overlaps, foreground_t)
     in_range = tf.math.logical_and(lower, upper)
-    ignored = tf.boolean_mask(row_idxs, in_range) 
+    ignored_idx = tf.boolean_mask(row_idxs, in_range)
 
-    return foreground, ignored
+    return foreground_idx, ignored_idx, argmax
+
+  @staticmethod
+  def compute_regression_targets(anchors,  bbox, mean=None, std_dev=None):
+    if mean is None:
+      mean = tf.constant([0.0, 0.0, 0.0, 0.0], dtype=tf.float32)
+
+    if std_dev is None:
+      std_dev = tf.constant([0.2, 0.2, 0.2, 0.2], dtype=tf.float32)
+
+    # Get the heights and widths
+    heights = anchors[:, 3] - anchors[:, 1]
+    widths = anchors[:, 2] - anchors[:, 0] 
+
+    # Compute the regression targets
+    dx1 = (bbox[:, 0] - anchors[:, 0]) / widths
+    dy1 = (bbox[:, 1] - anchors[:, 1]) / heights
+    dx2 = (bbox[:, 2] - anchors[:, 2]) / widths
+    dy2 = (bbox[:, 3] - anchors[:, 3]) / heights
+
+    # Standardize the targets, and return
+    targets = tf.transpose(tf.stack([dx1, dy1, dx2, dy2]))
+    return  (targets - mean) / std_dev
+
+  def compute_anchors_and_labels(self, bboxes, height, width):  
+    # Copy to avoid recomputing
+    anchors = tf.identity(self.all_anchors)
+
+    # Find the inner anchors
+    in_idx, out_idx = self.filter_outer_anchors(anchors, [height, width])
+    in_anchors = tf.gather(anchors, in_idx)
+    overlaps = self.compute_anchor_overlaps(in_anchors, bboxes)
+    foreground_idx, ignored_idx, argmax = self.compute_foreground_ignored(
+      overlaps)
+
+    # Set to 1 the last column of those anchors which are foreground
+    extra_coord = 4 * tf.ones(tf.shape(foreground_idx)[0], dtype=tf.int32)
+    foreground_idx = tf.stack([foreground_idx, extra_coord], axis=1)
+    in_anchors = tf.tensor_scatter_nd_update(
+      in_anchors, foreground_idx, tf.ones(
+        tf.shape(foreground_idx)[0], dtype=tf.float32))
+
+    # Set to -1 the last column of those anchors which are ignored
+    extra_coord = 4 * tf.ones(tf.shape(ignored_idx)[0], dtype=tf.int32)
+    ignored_idx = tf.stack([ignored_idx, extra_coord], axis=1)
+    in_anchors = tf.tensor_scatter_nd_update(
+      in_anchors, ignored_idx, tf.ones(
+        tf.shape(ignored_idx)[0], dtype=tf.float32) * -1.0)
+
+    # Update the foreground / ignore labels in the original anchors structure
+    extra_coord = 4 * tf.ones(tf.shape(in_idx)[0], dtype=tf.int32)
+    in_idx = tf.stack([in_idx, extra_coord], axis=1)
+    anchors = tf.tensor_scatter_nd_update(anchors, in_idx, in_anchors[:, -1])
+    
+    # Update the out-of-bounds anchors in the original anchors structure
+    extra_coord = 4 * tf.ones(tf.shape(out_idx)[0], dtype=tf.int32)
+    out_idx = tf.stack([out_idx, extra_coord], axis=1)
+    anchors = tf.tensor_scatter_nd_update(anchors, out_idx, tf.ones(
+        tf.shape(out_idx)[0], dtype=tf.float32) * -1.0)
+
+    # Compute the classification targets: argmax + 1 since 0 is background
+    classification_labels = tf.zeros((tf.shape(anchors)[0], ), dtype=tf.int32)
+    classification_labels = tf.tensor_scatter_nd_update(
+      classification_labels, in_idx[:, 0], argmax + 1)
+
+    # Prepare the regression target computation
+    foreground_anchors = tf.gather_nd(anchors, foreground_idx[:, 0])
+
+    argmax_foreground = tf.gather(argmax, foreground_idx[:, 0])
+    foreground_bboxes = tf.gather_nd(bboxes, argmax_foreground)
+
+    # Compute the regression targets
+    foreground_regression_targets = self.compute_regression_targets(
+      foreground_anchors, foreground_bboxes)
+
+    # Gradually adjust the regression targets to the right dimensions
+    temp_targets = tf.zeros((tf.shape(in_idx)[0], 4), dtype=tf.float32)
+    temp_targets = tf.tensor_scatter_nd_update(
+      temp_targets, foreground_idx[:, 0], foreground_regression_targets)
+
+    regression_targets = tf.zeros((tf.shape(anchors)[0], 4))
+    regression_targets = tf.tensor_scatter_nd_update(
+      regression_targets, in_idx[:, 0], temp_targets)
+
+    # Return the computed results
+    return anchors, classification_labels, regression_targets
 
   def __call__(self, augment_image=False, augment_probability=0.5):
     """Creates a TF compatible function which can be used to preprocess batches. 
@@ -269,29 +365,22 @@ class DataPreprocessor:
       bboxes = tf.stack([x1, y1, x2, y2], axis=1)
 
       # Perform anchor specific operations: filtering, IoU, and labelling
-      anchors = tf.identity(self.all_anchors)
-      in_idx = self.filter_outer_anchors(anchors, [new_image_h, new_image_w])
-      in_anchors = tf.gather(anchors, in_idx)
-      overlaps = self.compute_anchor_overlaps(in_anchors, bboxes)
-      foreground, ignored = self.compute_labels(overlaps)
-      
+      anchors, classification_labels, regression_targets = \
+        self.compute_anchors_and_labels(bboxes, new_image_h, new_image_w)
+
       # Pad the bboxes, to make TF batching possible
-      is_crowd = self.pad(is_crowd, MAX_PADDING_ROWS, dtype=tf.bool)
-      labels = self.pad(labels, MAX_PADDING_ROWS, dtype=tf.int64)
-      bboxes = self.pad(bboxes, MAX_PADDING_ROWS)
+      # is_crowd = self.pad(is_crowd, MAX_PADDING_ROWS, dtype=tf.bool)
+      # labels = self.pad(labels, MAX_PADDING_ROWS, dtype=tf.int64)
+      # bboxes = self.pad(bboxes, MAX_PADDING_ROWS)
 
       # Return the preprocessed batch
       return {
         "image": new_image, 
         "size": [tf.cast(new_image_h, tf.int32), tf.cast(new_image_w, tf.int32), 
                 new_image_c],
-        "bbox_count": bbox_count,
-        "is_crowd": is_crowd,
-        "labels": labels,
-        "bbox": bboxes,
-        "overlaps": overlaps,
-        "foreground": foreground,
-        "ignored": ignored
+        "anchor_type": anchors[:, 4], 
+        "regression_targets": regression_targets,
+        "classification_labels": classification_labels
       }
     return _inner
 
@@ -362,28 +451,17 @@ def prepare_split(data, shape):
   def _helper(batch):
     # Convert the dataset to np array
     batch = tfds.as_numpy(batch)
+    anchor_count = batch['anchor_type'].shape[-1]
 
-    # Reshape the data such that it can be distributed to the devices 
+    # Reshape the batch to allow pmaps to be used
     batch['image'] = jnp.reshape(batch['image'], (device_count, -1) + shape)
     batch['size'] = jnp.reshape(batch['size'], (device_count, -1, 3))
-    batch['bbox_count'] = jnp.reshape(batch['bbox_count'], 
-                                      (device_count, -1, 1))
-    batch['is_crowd'] = jnp.reshape(batch['is_crowd'], 
-                                    (device_count, -1, MAX_PADDING_ROWS))
-    batch['labels'] = jnp.reshape(batch['labels'], 
-                                  (device_count, -1, MAX_PADDING_ROWS))
-    batch['bbox'] = jnp.reshape(batch['bbox'], 
-                                (device_count, -1, MAX_PADDING_ROWS, 4))
-
-    # FIXME: This might need to be removed, since it's just for debug 
-    print("Original ignored shape:", batch['ignored'].shape)
-    print("Original foreground shape:", batch['foreground'].shape)
-    batch['overlaps'] = jnp.reshape(
-      batch['overlaps'], (device_count, -1, batch['overlaps'].shape[-2], batch['overlaps'].shape[-1]))    
-    batch['ignored'] = jnp.reshape(
-      batch['ignored'], (device_count, -1, batch['ignored'].shape[0]))
-    batch['foreground'] = jnp.reshape(
-      batch['foreground'], (device_count, -1, batch['foreground'].shape[0]))
+    batch['anchor_type'] = jnp.reshape(
+      batch['anchor_type'], (device_count, -1, anchor_count))
+    batch['regression_targets'] = jnp.reshape(
+      batch['regression_targets'], (device_count, -1, anchor_count, 4))
+    batch['classification_labels'] = jnp.reshape(
+      batch['classification_labels'], (device_count, -1, anchor_count))
     return batch
 
   return map(_helper, data)
