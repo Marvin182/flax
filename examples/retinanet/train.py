@@ -313,6 +313,7 @@ def train_retinanet_model(data, learning_rate=0.1, batch_size=64, epochs=5,
                                                      " of local devices"
   # Set up the data pipeline
   train_data, val_data = prepare_data(data, batch_size=batch_size)
+  train_iter = iter(train_data)
 
   # Crate the training parameters
   steps_per_epoch = int(math.ceil(data['train']['count'] / batch_size))
@@ -359,7 +360,8 @@ def train_retinanet_model(data, learning_rate=0.1, batch_size=64, epochs=5,
 
     # Run an epoch
     for step in range(steps_per_epoch):
-      batch = next(train_data)
+      # Use ._numpy() to avoid copy.
+      batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
       meta_state, metrics = p_step_fn(batch, meta_state)
       if step % 10 == 0:
         single_metric = jax.tree_map(lambda x: x[0], metrics)
@@ -371,8 +373,10 @@ def train_retinanet_model(data, learning_rate=0.1, batch_size=64, epochs=5,
 
     # Evaluate the model
     eval_results = []
+    val_iter = iter(val_data)
     for _ in range(steps_per_eval):
-      batch = next(val_data)
+      # Use ._numpy() to avoid copy.
+      batch = jax.tree_map(lambda x: x._numpy(), next(val_iter))  # pylint: disable=protected-access
       res = p_eval_fn(batch, meta_state)
       eval_results.append(jax.tree_map(lambda x: x[0], res))
     eval_results = aggregate_evals(eval_results)
@@ -382,4 +386,3 @@ def train_retinanet_model(data, learning_rate=0.1, batch_size=64, epochs=5,
       checkpoint_state(meta_state, epoch)
 
   return meta_state
-
