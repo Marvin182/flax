@@ -54,7 +54,7 @@ class DataPreprocessor:
       (max_size, max_size), anchor_config.levels, anchor_config.strides, 
       anchor_config.sizes, anchor_config.ratios, anchor_config.scales, 
       clip=True)  # Note the clip here only clips agaist the padded image
-    
+
     # Convert to tensor for the rest of the preprocessing
     self.all_anchors = tf.convert_to_tensor(self.all_anchors)
 
@@ -530,29 +530,7 @@ def read_data(prng_seed: int = 0):
   return data
 
 
-def prepare_split(data, shape):
-  device_count = jax.device_count()
-
-  def _helper(batch):
-    # Convert the dataset to np array
-    batch = tfds.as_numpy(batch)
-    anchor_count = batch['anchor_type'].shape[-1]
-
-    # Reshape the batch to allow pmaps to be used
-    batch['image'] = jnp.reshape(batch['image'], (device_count, -1) + shape)
-    batch['size'] = jnp.reshape(batch['size'], (device_count, -1, 3))
-    batch['anchor_type'] = jnp.reshape(
-      batch['anchor_type'], (device_count, -1, anchor_count))
-    batch['regression_targets'] = jnp.reshape(
-      batch['regression_targets'], (device_count, -1, anchor_count, 4))
-    batch['classification_labels'] = jnp.reshape(
-      batch['classification_labels'], (device_count, -1, anchor_count))
-    return batch
-
-  return map(_helper, data)
-
-
-def prepare_data(data, batch_size):
+def prepare_data(data: tf.data.Dataset, per_device_batch_size: int) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
   """Process a COCO dataset, and produce training and testing input pipelines.
 
   Args:
@@ -570,11 +548,11 @@ def prepare_data(data, batch_size):
         }
       }
       ```
-    batch_size: the size of a batch
+    per_device_batch_size: The batch size per device (GPU or TPU core).
+      E.g. per_device_batch_size = global_batch_size // jax.device_count().
 
   Returns:
-    A tuple containing a generator for the training batches and a generator for
-    the testing batches respectively.
+    A tuple containing the preprocessed datasets for training and testing.
   """
   autotune = tf.data.experimental.AUTOTUNE
 
@@ -584,11 +562,14 @@ def prepare_data(data, batch_size):
   # Prepare training data: standardize, resize and randomly flip the images
   train = data["train"]["data"].repeat().shuffle(batch_size * 16, seed=0).map(
     batch_preprocessor(augment_image=True), num_parallel_calls=autotune)
-  train = prepare_split(train.batch(batch_size), data["shape"])
+  batch_dims = [jax.local_device_count(), per_device_batch_size]
+  for batch_size in reversed(batch_dimes):
+    train = train.batch(batch_size, drop_remainder=True)
 
   # Prepare the test data: only standardize and resize
   test = data["test"]["data"].map(batch_preprocessor(), 
                                   num_parallel_calls=autotune)
-  test = prepare_split(test.batch(batch_size), data["shape"])
+  for batch_size in reversed(batch_dimes):
+    test = test.batch(batch_size, drop_remainder=True)
 
   return train, test
