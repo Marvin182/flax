@@ -17,13 +17,30 @@ class DataPreprocessor:
   """This class handles data preprocessing for object detection tasks.
   """
 
-  def __init__(self, min_size=600, max_size=1000, mean=None, std_dev=None, 
-               anchor_config : AnchorConfig = None):
+  def __init__(self, min_size=600, max_size=1000, foreground_t=0.5, 
+               ignore_t=0.4, mean=None, std_dev=None, bbox_mean=None, 
+               bbox_std=None, anchor_config : AnchorConfig = None):
     assert min_size > 0 and max_size > 0 and min_size <= max_size, \
       "The following requirement is violated: 0 < min_size <= max_size"
+    assert foreground_t > 0 and ignore_t > 0 and ignore_t <= foreground_t, \
+      "The following requirement is violated: 0 < ignore_t <= foreground_t"
 
     self.min_size = min_size
     self.max_size = max_size
+    self.foreground_t = foreground_t
+    self.ignore_t = ignore_t
+
+
+    # Create the mean and std deviation constants for regression standardization
+    if bbox_mean is None:
+      self.bbox_mean = tf.constant([0.0, 0.0, 0.0, 0.0], dtype=tf.float32)
+    else:
+      self.bbox_mean = bbox_mean
+    
+    if bbox_std is None:
+      self.bbox_std = tf.constant([0.2, 0.2, 0.2, 0.2], dtype=tf.float32)
+    else:
+      self.bbox_std = bbox_std
 
     # If no mean and std deviation is provided, then reuse the ImageNet ones
     self.mean = mean if mean is not None else [0.485, 0.456, 0.406]
@@ -35,10 +52,37 @@ class DataPreprocessor:
 
     self.all_anchors = generate_all_anchors(
       (max_size, max_size), anchor_config.levels, anchor_config.strides, 
-      anchor_config.sizes, anchor_config.ratios, anchor_config.scales)
+      anchor_config.sizes, anchor_config.ratios, anchor_config.scales, 
+      clip=True)  # Note the clip here only clips agaist the padded image
     
     # Convert to tensor for the rest of the preprocessing
     self.all_anchors = tf.convert_to_tensor(self.all_anchors)
+
+  def get_clipped_anchors(self, height, width):
+    """Clips and returns the base anchors.
+
+    More specifically, the x coordinates of the base anchors are clipped, 
+    such that they are always found in the `[0, width]` interval, and 
+    the `y` coordinates are always found in the `[0, height]` interval.
+
+    Args:
+      height: the true height of the image
+      width: the true width of the image
+
+    Returns:
+      A matrix of the form (|A|, 5), which contains the clipped anchors, as well
+      as an extra column which can be used to store the status of the anchor.
+    """
+    # Copy the base anchors; thsese should have 5 columns
+    anchors = tf.identity(self.all_anchors)
+
+    # Clip the anchor coordinates
+    x1 = tf.math.minimum(tf.math.maximum(anchors[:, 0], 0.0), width)
+    y1 = tf.math.minimum(tf.math.maximum(anchors[:, 1], 0.0), height)
+    x2 = tf.math.minimum(tf.math.maximum(anchors[:, 2], 0.0), width)
+    y2 = tf.math.minimum(tf.math.maximum(anchors[:, 3], 0.0), height)
+
+    return tf.stack([x1, y1, x2, y2, anchors[:, 4]], axis=1)
 
   def standardize_image(self, image):
     """Standardizes the image values.
@@ -57,7 +101,7 @@ class DataPreprocessor:
     image /= tf.constant(self.std, shape=[1, 1, 3])
     return image
 
-  def resize_image(self, image, min_size=600, max_size=1000):
+  def resize_image(self, image):
     """Resizes and pads the image to `max_size` x `max_size`.
 
     The image is resized, such that its shorter size becomes `min_size`, while
@@ -113,7 +157,7 @@ class DataPreprocessor:
     ## BBoxes should be normalized, and have the structure: [y1, x1, y2, x2]
     image = tf.image.flip_left_right(image)
     bboxes = tf.map_fn(
-      lambda x: tf.convert_to_tensor([x[0], 1.0 - x[1], x[2], 1.0 - x[3]], 
+      lambda x: tf.convert_to_tensor([x[0], 1.0 - x[3], x[2], 1.0 - x[1]], 
       dtype=tf.float32), bboxes)
     return image, bboxes
 
@@ -193,39 +237,57 @@ class DataPreprocessor:
     overlaps = tf.map_fn(tf_jaccard_index, (anchors, bboxes), dtype=tf.float32)
     return tf.reshape(overlaps, [anchor_count, bbox_count])
 
-  @staticmethod
-  def compute_foreground_ignored(overlaps : tf.Tensor, 
-                                 foreground_t : float = 0.5, 
-                                 ignore_t : float = 0.4):
-    assert foreground_t > 0 and ignore_t > 0 and ignore_t <= foreground_t, \
-      "The following requirement is violated: 0 < ignore_t <= foreground_t"
+  def compute_foreground_ignored(self, overlaps : tf.Tensor):
+    """Identifies the row indices of the foreground and ignored anchors.
 
+    More specifically, this method will inspect the argmax of `overlaps` 
+    on eachrow, and computes the membership to the foreground and ignored 
+    anchor sets based on the overlap of the argmax. 
+
+    Args:
+      overlaps: an (|A|, |B|) matrix, where each entry stores the IoU of an 
+        anchor and a bbox. Here, |A| is the count of anchors, and |B| is 
+        the count of ground truth bboxes
+
+    Returns:
+      The indices of the foreground and ignored anchors respectively, as well
+      as the argmax indices in the `overlaps`. 
+    """
     # Get the max overlap value for each of the anchors
     row_idxs = tf.range(tf.shape(overlaps)[0], dtype=tf.int32)
     argmax = tf.argmax(overlaps, axis=1, output_type=tf.int32)
     indexes = tf.stack([row_idxs, argmax], axis=1)
-    max_overlaps = tf.gather_nd(overlaps, indexes)
+    max_overlaps = tf.gather_nd(overlaps, indexes)  
     
     # Get the indexes of the foreground anchors
-    lower = tf.math.greater_equal(max_overlaps, foreground_t)
+    lower = tf.math.greater_equal(max_overlaps, self.foreground_t)
     foreground_idx = tf.boolean_mask(row_idxs, lower)
 
     # Get the indexes of the ignored anchors
-    lower = tf.math.greater_equal(max_overlaps, ignore_t)
-    upper = tf.math.less(max_overlaps, foreground_t)
+    lower = tf.math.greater_equal(max_overlaps, self.ignore_t)
+    upper = tf.math.less(max_overlaps, self.foreground_t)
     in_range = tf.math.logical_and(lower, upper)
     ignored_idx = tf.boolean_mask(row_idxs, in_range)
 
     return foreground_idx, ignored_idx, argmax
 
-  @staticmethod
-  def compute_regression_targets(anchors,  bbox, mean=None, std_dev=None):
-    if mean is None:
-      mean = tf.constant([0.0, 0.0, 0.0, 0.0], dtype=tf.float32)
+  def compute_regression_targets(self, anchors,  bbox):
+    """Computes the regression targets of the `anchors`.
 
-    if std_dev is None:
-      std_dev = tf.constant([0.2, 0.2, 0.2, 0.2], dtype=tf.float32)
+    This method also applies standardization on the regression targets. 
+    The `anchors` and `bbox` parameters must have the same number of rows. 
+    That is, for an anchor at row `i` in `anchors`, bbox must store its ground 
+    truth at row `i` in `bbox`. 
 
+    Args:
+      anchors: the anchors for which the targets are computed, having a 
+        shape like (|A|, 4)
+      bbox: the bboxes for which the anchor targets are computed, having a 
+        shape like (|A|, 4)
+
+    Returns:
+      The standardized anchor targets, having the shape (|A|, 4).
+    """
     # Get the heights and widths
     heights = anchors[:, 3] - anchors[:, 1]
     widths = anchors[:, 2] - anchors[:, 0] 
@@ -238,11 +300,40 @@ class DataPreprocessor:
 
     # Standardize the targets, and return
     targets = tf.transpose(tf.stack([dx1, dy1, dx2, dy2]))
-    return  (targets - mean) / std_dev
+    return  (targets - self.bbox_mean) / self.bbox_std
 
-  def compute_anchors_and_labels(self, bboxes, height, width):  
+  def compute_anchors_and_labels(self, bboxes, height, width):
+    """Computes the anchors, their type, as well as their targets.
+
+    More specifically, this method will compute all the anchors within the 
+    padded image, and will determine whether they are foreground, background
+    or ignored. The method also determines the targets for both regression 
+    and classification of the candidate anchors, based on the IoU with the
+    available ground truth bounding boxes. 
+    
+    Args:
+      bboxes: a tensor for the shape `(|B|, 4)`, which holds the ground truth
+        bounding boxes of the image
+      height: the height of the true image within the padded image
+      width: the width of the true image within the padded image
+
+    Returns:
+      A triple, which stores the following elements:
+        * `anchors`: an (|A|, 5) tensor, where |A| is equal to the number of 
+          anchors that can be deployed in the padded image. The first 4 elements
+          on each row represent the [x1, y1, x2, y2] coordinates of the anchor,
+          while the last entry can either be -1 (ignored), 0 (background) or 
+          1 (foreground).
+        * `classification_labels`: an (|A|,) shaped tensor, which contains the 
+          classification target for each anchor. `0` is considered background.
+          During training, only the non-ignored anchors should be used.
+        * `regression_targets`: an (|A|, 4) shaped tensor, which contains the 
+          regression targets for each of the anchor's 4 coordinates. During 
+          training, only the foreground anchors should be considered.
+    """
     # Copy to avoid recomputing
-    anchors = tf.identity(self.all_anchors)
+    anchors = self.get_clipped_anchors(height, width)
+    # anchors = tf.identity(self.all_anchors)
 
     # Find the inner anchors
     in_idx, out_idx = self.filter_outer_anchors(anchors, [height, width])
@@ -276,29 +367,28 @@ class DataPreprocessor:
     anchors = tf.tensor_scatter_nd_update(anchors, out_idx, tf.ones(
         tf.shape(out_idx)[0], dtype=tf.float32) * -1.0)
 
-    # Compute the classification targets: argmax + 1 since 0 is background
-    classification_labels = tf.zeros((tf.shape(anchors)[0], ), dtype=tf.int32)
-    classification_labels = tf.tensor_scatter_nd_update(
-      classification_labels, in_idx[:, 0], argmax + 1)
+    # Compute the classification targets
+    indices = tf.expand_dims(in_idx[:, 0], 1)
+    classification_labels = tf.scatter_nd(indices, argmax, 
+      (tf.shape(anchors)[0],))
 
     # Prepare the regression target computation
-    foreground_anchors = tf.gather_nd(anchors, foreground_idx[:, 0])
-
+    foreground_anchors = tf.gather(anchors, foreground_idx[:, 0])
     argmax_foreground = tf.gather(argmax, foreground_idx[:, 0])
-    foreground_bboxes = tf.gather_nd(bboxes, argmax_foreground)
+    foreground_bboxes = tf.gather(bboxes, argmax_foreground)
 
     # Compute the regression targets
     foreground_regression_targets = self.compute_regression_targets(
       foreground_anchors, foreground_bboxes)
 
     # Gradually adjust the regression targets to the right dimensions
-    temp_targets = tf.zeros((tf.shape(in_idx)[0], 4), dtype=tf.float32)
-    temp_targets = tf.tensor_scatter_nd_update(
-      temp_targets, foreground_idx[:, 0], foreground_regression_targets)
+    indices = tf.expand_dims(foreground_idx[:, 0], 1)
+    temp_targets = tf.scatter_nd(indices, foreground_regression_targets, 
+      (tf.shape(in_idx)[0], 4))
 
-    regression_targets = tf.zeros((tf.shape(anchors)[0], 4))
-    regression_targets = tf.tensor_scatter_nd_update(
-      regression_targets, in_idx[:, 0], temp_targets)
+    indices = tf.expand_dims(in_idx[:, 0], 1)
+    regression_targets = tf.scatter_nd(indices, temp_targets,
+      (tf.shape(anchors)[0], 4))
 
     # Return the computed results
     return anchors, classification_labels, regression_targets
@@ -368,19 +458,14 @@ class DataPreprocessor:
       anchors, classification_labels, regression_targets = \
         self.compute_anchors_and_labels(bboxes, new_image_h, new_image_w)
 
-      # Pad the bboxes, to make TF batching possible
-      # is_crowd = self.pad(is_crowd, MAX_PADDING_ROWS, dtype=tf.bool)
-      # labels = self.pad(labels, MAX_PADDING_ROWS, dtype=tf.int64)
-      # bboxes = self.pad(bboxes, MAX_PADDING_ROWS)
-
       # Return the preprocessed batch
       return {
         "image": new_image, 
         "size": [tf.cast(new_image_h, tf.int32), tf.cast(new_image_w, tf.int32), 
                 new_image_c],
-        "anchor_type": anchors[:, 4], 
-        "regression_targets": regression_targets,
-        "classification_labels": classification_labels
+        "anchor_type": tf.cast(anchors[:, -1], dtype=tf.int32), 
+        "classification_labels": classification_labels,
+        "regression_targets": regression_targets
       }
     return _inner
 

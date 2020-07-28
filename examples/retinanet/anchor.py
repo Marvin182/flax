@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from jax import numpy as jnp
 
 import flax
+import jax
 
 
 @dataclass
@@ -87,8 +88,30 @@ def generate_anchors(shape, stride, size, ratios, scales, dtype=jnp.float32):
   return jnp.tile(jnp.expand_dims(centers, axis=0), (shape[0], 1, 1))
 
 
+def clip_anchors(anchors, shape):
+  """Clips the anchors, such that they do not exceed `shape`
+
+  Args:
+    anchors: an (|A|, 4) matrix, where |A| is the number of anchors; the 
+      4 elements on each row represent the anchor coordinates
+    shape: a list or tuple of 2 elements: (height, width)
+
+  Returns:
+    A matrix of the form (|A|, 4), which contains the clipped anchors
+  """
+  anchors = jax.ops.index_update(anchors, jax.ops.index[:, 0], 
+    jnp.minimum(jnp.maximum(anchors[:, 0], 0), shape[1]))
+  anchors = jax.ops.index_update(anchors, jax.ops.index[:, 1], 
+    jnp.minimum(jnp.maximum(anchors[:, 1], 0), shape[0]))
+  anchors = jax.ops.index_update(anchors, jax.ops.index[:, 2], 
+    jnp.minimum(jnp.maximum(anchors[:, 2], 0), shape[1]))
+  anchors = jax.ops.index_update(anchors, jax.ops.index[:, 3], 
+    jnp.minimum(jnp.maximum(anchors[:, 3], 0), shape[0]))
+  return anchors
+
+
 def generate_all_anchors(shape, levels, strides, sizes, ratios, scales, 
-                         dtype=jnp.float32):
+                         clip=False, dtype=jnp.float32):
   """Generate all the anchors for an image of a given size.
 
   More specifically, given an image size, this method generates the entire 
@@ -101,6 +124,8 @@ def generate_all_anchors(shape, levels, strides, sizes, ratios, scales,
     sizes: a list of sizes in the original image of the anchors at each level
     ratios: the aspect ratios for the anchors
     scales: the anchor scales
+    clip: True if the anchor coordinates should be clipped to not exceed the 
+      bounds imposed by the `shape` parameter
     dtype: the data type of the output
     
   Returns:
@@ -116,7 +141,7 @@ def generate_all_anchors(shape, levels, strides, sizes, ratios, scales,
   shape = jnp.array(shape)
   feature_maps = [(shape + 2 ** level - 1) // (2 ** level) for level in levels]
 
-  # Stack stack the anchors on axis 0: first levels[0], ..., levels[-1] 
+  # Stack the anchors on axis 0: first levels[0], ..., levels[-1] 
   anchors = jnp.zeros((1, 0, 4), dtype=dtype)
   for idx, feature_map in enumerate(feature_maps):
     res = generate_anchors((1,) + tuple(feature_map), strides[idx], 
@@ -124,6 +149,11 @@ def generate_all_anchors(shape, levels, strides, sizes, ratios, scales,
     anchors = jnp.append(anchors, res, axis=1)
   
   anchors = anchors[0, :, :]
+
+  # Clip the anchors such that their coords do not fall outside the image bounds
+  if clip:
+    anchors = clip_anchors(anchors, shape)
+
   extra_zeros = jnp.zeros((anchors.shape[0], 1), dtype=dtype)
   return jnp.concatenate((anchors, extra_zeros), axis=1)
 
