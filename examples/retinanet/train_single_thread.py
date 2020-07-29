@@ -1,11 +1,24 @@
-from input_pipeline import prepare_data
-from model import create_retinanet
 from flax.training import checkpoints
+from input_pipeline import prepare_data
 from jax import numpy as jnp
+from model import create_retinanet
+from typing import Any, Dict, Iterable, Mapping, Tuple 
 
 import flax
 import jax
 import math
+
+
+@flax.struct.dataclass
+class CheckpointState:
+  """A dataclass which stores the state of the training loop.
+  """
+  # The state variable of the model
+  model_state : flax.nn.Collection
+  # The optimizer, which also holds the model
+  optimizer : flax.optim.Optimizer
+  # The global state of this checkpoint
+  step : int = -1
 
 
 def create_scheduled_decay_fn(learning_rate: float, training_steps: int, 
@@ -45,7 +58,7 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
   division_schedule = jnp.sort(jnp.unique(division_schedule)) + warmup_steps
   
   # Define the decay function
-  def decay_fn(step):
+  def decay_fn(step: jnp.int) -> jnp.float:
     lr = lr / division_factor ** jnp.argmax(division_schedule > step)
 
     # Linearly increase the learning rate during warmup
@@ -54,7 +67,9 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
   return decay_fn
 
 
-def create_model(rng, depth=50, classes=1000, shape=(224, 224, 3), dtype=jnp.float32):
+def create_model(rng: jnp.ndarray, depth: int = 50, classes: int = 1000, 
+                 shape: Iterable[int] = (224, 224, 3), 
+                 dtype: jnp.dtype = jnp.float32) -> flax.nn.Model:
   """Creates a RetinaNet model.
 
   Args:
@@ -77,8 +92,9 @@ def create_model(rng, depth=50, classes=1000, shape=(224, 224, 3), dtype=jnp.flo
   return flax.nn.Model(partial_module, params), init_state
 
 
-def create_optimizer(model, optimizer="momentum", **optimizer_params):
-  """Create either a Momentum or an Adam optimizer.
+def create_optimizer(model: flax.nn.Model, optimizer: str = "momentum", 
+                     **optimizer_params) -> flax.optim.Optimizer:
+  """Create either an Adam or Momentum optimizer.
 
   Args:
     model: a flax.nn.Model object, which encapsulates the neural network
@@ -98,40 +114,102 @@ def create_optimizer(model, optimizer="momentum", **optimizer_params):
   return optimizer_def.create(model)
 
 
-@jax.vmap
-def cross_entropy_loss(logits, label):
-  """Implements the Cross Entropy (Log-loss).
+def _focal_loss(logits: jnp.array, label: int, anchor_type: int, 
+               alpha: float = 0.25, gamma: float = 2.0) -> float:
+  """Implements the Focal Loss.
 
   Args:
-    logits: the logit array
-    label: the ground truth
+    logits: an array of logits, with as many entries as candidate classes
+    label: the ground truth label
+    anchor_type: an integer which identifies the type of the anchor: 
+      ignored (-1), background (0), foreground (1). If -1, the loss will be 0
+    alpha: the value of the alpha constant in the Focal Loss
+    gamma: the value of the gamma constant in the Focal Loss
 
   Returns:
-    The Log-loss
+    The value of the Focal Loss for this anchor.
   """
-  return -jnp.log(logits[label])
+  if anchor_type == -1:
+    return 0
+  return -alpha * ((1 - logits[label]) ** gamma) * jnp.log(logits[label])
+focal_loss = jax.vmap(_focal_loss, in_axes=[0, 0, 0, None, None])
 
 
-def compute_metrics(pred, labels):
+@jax.vmap
+def _smooth_l1(regressions: jnp.array, targets: jnp.array, 
+               anchor_type: int) -> float:
+  """Implements the Smooth-L1 loss. 
+
+  Args:
+    regressions: an array of 4 elements containing the predicted regressions
+    targets: an array of 4 elements containing the target regressions
+    anchor_type: the type of the anchor whose predictions are being evaluated
+  
+  Returns:
+    The value of the Smooth-L1 loss for this anchor.
+  """
+  if anchor_type != 1:
+    return 0
+  deltas = regressions - targets
+  return l * jnp.sum(jnp.where(jnp.absolute(deltas) < 1.0, 0.5 * deltas ** 2.0, 
+                     jnp.absolute(deltas) - 0.5))
+
+
+def _retinanet_loss(classifications: jnp.array, regressions: jnp.array, 
+                    anchor_types: jnp.array, classification_targets: jnp.array, 
+                    regression_targets: jnp.array, 
+                    reg_weight: float = 1.0) -> float:
+  """Implements the loss for the RetinaNet: Focal Loss and Smooth-L1
+
+  Args:
+    predictions: a matrix of size (|A|, K), where |A| is the number of anchors
+      and K is the number of classes, that cotains the model's predictions 
+    regressions: a matrix of size (|A|, 4) containing the predictions of 
+      the model for anchor location offsets
+    anchor_types: an array of size |A| indicating the type of each anchor: 
+      ignored (-1), background (0), foreground (1)
+    classification_targets: an array of |A| elements, containing the ground 
+      truth labels
+    regression_targets: a matrix of (|A|, 4) elements, containing the ground
+      truth regressions
+    reg_weight: a scalar, which indicates the weight of the Smooth-L1 
+      regularization term
+
+  Returns:
+    The image loss given by the RetinaNet loss function.
+  """
+  valid_anchors = (anchor_types >= 0).sum()
+  fl = focal_loss(classifications, classification_targets, anchor_types)
+  sl1 = smooth_l1(regressions, regression_targets, anchor_type)
+  return (fl + sl1 * reg_weight) / valid_anchors  
+retinanet_loss = jax.vmap(_retinanet_loss, in_axes=[0] * 5 + [None])
+
+
+def compute_metrics(classifications: jnp.array, regressions: jnp.array, 
+                    bboxes: jnp.array, 
+                    data: Mapping[str, jnp.array]) -> Dict[str, float]:
   """Returns the accuracy and the cross entropy.
 
   Args:
-    pred: the logits
-    labels: the ground truths
+    classifications: the classifications predicted by the model
+    regressions: the regression matrix predicted by the model
+    bboxes: the bboxes generated by the model, by applying the regressions to 
+      the anchors
+    data: a dictionary which maps from the name of the label to the list storing
+      the ground truths
 
   Returns:
     A dictionary containins the metrics
   """
-  cross_entropy = jnp.mean(cross_entropy_loss(pred, labels))
-  accuracy = jnp.mean(jnp.argmax(pred, axis=1) == labels)
   metrics = {
-    "accuracy": accuracy,
-    "cross_entropy": cross_entropy
+    "retinanet_loss": retinanet_loss(
+      classifications, regressions, data['anchor_type'], 
+      data['classification_labels'], data['regression_targets'])
   }
-  return jax.lax.pmean(metrics, "device")
+  return metrics
 
 
-def eval(data, meta_state):
+def eval(data: jnp.array, meta_state: CheckpointState) -> Dict[str, float]:
   """Evaluates the model.
 
   The evaluation is done against the Log-loss and the Accuracy
@@ -145,30 +223,27 @@ def eval(data, meta_state):
     The accuracy and the Log-loss aggregated across multiple workers.
   """
   with flax.nn.stateful(meta_state.model_state, mutable=False):
-    pred = meta_state.optimizer.target(data['image'], train=False)
-  return compute_metrics(pred, data['label'])
+    regressions, classifications, bboxes = meta_state.optimizer.target(
+      data['image'], train=False)
+  return compute_metrics(regressions, classifications, bboxes, data)
+
 
 def aggregate_evals(eval_array):
-  vals = jnp.array(list(map(lambda x: list(x.values()), eval_array)))
-  return dict(zip(eval_array[0].keys(), jnp.mean(vals, axis=0)))
+  accumulator = {key: 0.0 for key in eval_array[0]}
+  for d in eval_array:
+    for k, v in d.items():
+      accumulator[k] += v
+
+  count = len(eval_array)
+  for k in accumulator:
+    count[k] /= count
+
+  return accumulator 
 
 
-@flax.struct.dataclass
-class CheckpointState:
-  """A dataclass which stores the state of the training loop.
-  """
-  # The state variable of the model
-  model_state : flax.nn.Collection
-  # The optimizer, which also holds the model
-  optimizer : flax.optim.Optimizer
-  # The global state of this checkpoint
-  step : int = -1
-
-
-def checkpoint_state(meta_state : CheckpointState, checkpoint_step : int,
-                     checkpoint_dir="checkpoints"):
-  """
-  Checkpoints the training state.
+def checkpoint_state(meta_state: CheckpointState, checkpoint_step: int,
+                     checkpoint_dir: str = "checkpoints") -> None:
+  """Checkpoints the training state.
 
   Args:
     meta_state: a `CheckpointState` object, which contains the state of
@@ -176,40 +251,26 @@ def checkpoint_state(meta_state : CheckpointState, checkpoint_step : int,
     checkpoint_step: a checkpoint step, used for versioning the checkpoint
     checkpoint_dir: the directory where the checkpoint is stored
   """
-  if jax.host_id() == 0:
-    meta_state = jax.device_get(jax.tree_map(lambda x: x[0], meta_state))
-    checkpoints.save_checkpoint(checkpoint_dir, meta_state, checkpoint_step)
+  checkpoints.save_checkpoint(checkpoint_dir, meta_state, checkpoint_step)
 
 
-def restore_checkpoint(meta_state, checkpoint_dir="checkpoints"):
+def restore_checkpoint(meta_state: CheckpointState, 
+                       checkpoint_dir: str = "checkpoints") -> CheckpointState:
   """Restores the latest checkpoint.
 
-  More specifically, either return the latest checkpoint from the
+  More specifically, either returns the latest checkpoint from the
   `checkpoint_dir` or returns the `meta_state` object, if no such checkpoint
   exists.
 
   Args:
     meta_state: a `CheckpointState` object, used as last resort if no checkpoint
-      does exist
+      exists
     checkpoint_dir: the directory where the checkpoints are searched for
 
   Returns:
-    Either the latest checkpoint, if it exists, or the `meta_state` object
+    Either the latest checkpoint, if it exists, or the `meta_state` object.
   """
   return checkpoints.restore_checkpoint(checkpoint_dir, meta_state)
-
-
-def sync_model_state(meta_state):
-  """Synchronizes the model_state across devices.
-
-  Args:
-    meta_state: a `CheckpointState` object to be used towards synchronization
-
-  Returns:
-    A new CheckpointState object with an updated `model_state` field.
-  """
-  mean = jax.pmap(lambda x: jax.lax.pmean(x, 'axis'), 'axis')
-  return meta_state.replace(model_state=mean(meta_state.model_state))
 
 
 def create_step_fn(lr_function):
@@ -224,7 +285,8 @@ def create_step_fn(lr_function):
     in two arguments: the batch, and a `CheckpointState` object, which
     stores the current training state.
   """
-  def take_step(data, meta_state: CheckpointState):
+  def take_step(data: Mapping[str, jnp.array], 
+                meta_state: CheckpointState) -> Tuple[CheckpointState, Any]:
     """Trains the model on a batch and returns the updated model.
 
     Args:
@@ -234,18 +296,15 @@ def create_step_fn(lr_function):
     Returns:
       The updated model as a `CheckpointState` object and the batch's loss
     """
-    def _loss_fn(model, state):
+    def _loss_fn(model: flax.nn.Model, state: flax.nn.Collection):
       with flax.nn.stateful(state) as new_state:
-        pred = model(data['image'])
-      loss = jnp.mean(cross_entropy_loss(pred, data['label']))
+        classifications, regressions, _ = model(data['image'])
+      loss = jnp.mean(retinanet_loss(classifications, regressions, 
+                                     data['anchor_type'],
+                                     data['classification_labels'],
+                                     data['regression_targets']))
 
-      # Penalize large model weights via a decayed l2 norm
-      weight_decay = 0.0001 * 0.5
-      weights = jax.tree_leaves(model.params)
-      weight_loss = weight_decay * sum([jnp.sum(x ** 2)
-                                        for x in weights if x.ndim > 1])
-
-      return loss + weight_loss, (new_state, pred)
+      return loss, new_state
 
     # flax.struct.dataclass is immutable, so unwrap it
     step = meta_state.step + 1
@@ -254,10 +313,6 @@ def create_step_fn(lr_function):
     aux, grads = jax.value_and_grad(_loss_fn, has_aux=True)(
       meta_state.optimizer.target, meta_state.model_state)
     new_model_state, pred = aux[1]
-    metrics = compute_metrics(pred, data['label'])
-
-    # Synchronize device model across devices
-    grads = jax.lax.pmean(grads, "device")
 
     # Apply the gradients to the model
     updated_optimizer = meta_state.optimizer.apply_gradient(
@@ -267,7 +322,7 @@ def create_step_fn(lr_function):
     meta_state = meta_state.replace(step=step, model_state=new_model_state,
                                     optimizer=updated_optimizer)
 
-    return meta_state, metrics
+    return meta_state, {"retinanet_loss": loss}
 
   return take_step
 
@@ -300,19 +355,7 @@ def train_retinanet_model(train_data: jnp.array, test_data: jnp.array,
   Returns:
     A `CheckpointState` object containing the trained model. 
   """
-  assert 0 == batch_size % jax.local_device_count(), "batch_size must be " \
-                                                     "divisible by the number" \
-                                                     " of local devices"
-  # Set up the data pipeline
-  train_data, val_data = prepare_data(data, batch_size=batch_size)
-  train_iter = iter(train_data)
-
-  # Crate the training parameters
-  steps_per_epoch = int(math.ceil(data['train']['count'] / batch_size))
-  steps_per_eval = int(math.ceil(data['test']['count'] / batch_size))
-  total_step_count = epochs * steps_per_epoch
-
-  # Set the correct dtype
+  # Set the correct dtype based on the platform being used
   dtype = jnp.float32
   if half_precision:
     if jax.local_devices()[0].platform == 'tpu':
@@ -329,49 +372,34 @@ def train_retinanet_model(train_data: jnp.array, test_data: jnp.array,
 
   # Try to restore the state of a previous run
   meta_state = restore_checkpoint(meta_state) if try_restore else meta_state
-
-  # Replicate the state across devices
-  meta_state = flax.jax_utils.replicate(meta_state)  
+  start_step = meta_state.step
 
   # Prepare the LR scheduler
   learning_rate *= batch_size / 256
-  learning_rate_fn = create_decay_fn(learning_rate, training_steps, 
-                                     warmup_steps)
+  learning_rate_fn = create_scheduled_decay_fn(learning_rate, training_steps, 
+                                               warmup_steps)
 
-  # Prepare the training loop for distributed runs
+  # Create the step function
   step_fn = create_step_fn(learning_rate_fn)
-  p_step_fn = jax.pmap(step_fn, axis_name="device")
-  p_eval_fn = jax.pmap(eval, axis_name="device")
 
   # Run the training loop
-  for epoch in range(start_epoch, epochs):
-    step_offset = epoch * steps_per_epoch
+  for step in range(start_step, warmup_steps + training_steps):
+    batch = next(train_data)
+    meta_state, loss = step_fn(batch, meta_state)
+    if step % 10 == 0:
+      print("(Train Step #{}) RetinaNet Loss: {}".format(step, loss))
 
-    # Run an epoch
-    for step in range(steps_per_epoch):
-      # Use ._numpy() to avoid copy.
-      batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
-      meta_state, metrics = p_step_fn(batch, meta_state)
-      if step % 10 == 0:
-        single_metric = jax.tree_map(lambda x: x[0], metrics)
-        print("(Train Step #{}) Log Loss: {}".format(
-          step + step_offset, single_metric))
-
-    # Sync up the model_state after every epoch
-    meta_state = sync_model_state(meta_state)
-
-    # Evaluate the model
-    eval_results = []
-    val_iter = iter(val_data)
-    for _ in range(steps_per_eval):
-      # Use ._numpy() to avoid copy.
-      batch = jax.tree_map(lambda x: x._numpy(), next(val_iter))  # pylint: disable=protected-access
-      res = p_eval_fn(batch, meta_state)
-      eval_results.append(jax.tree_map(lambda x: x[0], res))
-    eval_results = aggregate_evals(eval_results)
-    print("(Epoch #{}) Evaluation results:\n".format(epoch), eval_results)
-
-    if epoch % checkpoint_period == 0:
+    # Evaluate and checkpoint the model
+    if step % checkpoint_period == 0:
+      epoch = step // checkpoint_period
       checkpoint_state(meta_state, epoch)
+      
+      eval_results = []
+      for _ in range(100):
+        batch = next(test_data)
+        results = eval(batch, meta_state)
+        eval_results.append(results)
+      eval_results = aggregate_evals(eval_results)
+      print("(Epoch #{}) Evaluation results:\n".format(epoch), eval_results)
 
   return meta_state

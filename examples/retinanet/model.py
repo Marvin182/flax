@@ -323,20 +323,32 @@ class RetinaNet(flax.nn.Module):
                                              dtype=dtype)
 
     # Obtain regresssions and classifications from P3 to P7
-    outputs = {}
+    bboxes = jnp.zeros((data.shape[0], 0, 4), dtype=dtype)
+    regressions = jnp.zeros((data.shape[0], 0, 4), dtype=dtype)
+    classifications = jnp.zeros((data.shape[0], 0, classes), dtype=jnp.int32)
+
     for idx, layer_idx in enumerate(range(3, 8)):
-      input = fpn_features["P{}".format(layer_idx)]
+      # Get the feature maps for this subnet
+      layer_input = fpn_features["P{}".format(layer_idx)]
 
-      regressions = regression_subnet(input)
-      classifications = classification_subnet(input)
+      # Compute the regressions and the classifications, then append them 
+      regressions_temp = regression_subnet(layer_input)
+      classifications_temp = classification_subnet(layer_input) 
 
-      anchors = anchor_unpacker(input.shape[:3], anchors_config.strides[idx],
-                                anchors_config.sizes[idx])
-      bboxes = BBoxRegressor(anchors, regressions, dtype=dtype)
+      regressions = jnp.append(regressions, regressions_temp, axis=0)
+      classifications = jnp.append(classifications, classifications_temp, 
+                                   axis=0)
 
-      outputs[layer_idx] = (input, bboxes, regressions, classifications)
+      # If not training, then expand the anchors and apply regressions
+      if not train:
+        anchors = anchor_unpacker(layer_input.shape[:3], 
+                                  anchors_config.strides[idx],
+                                  anchors_config.sizes[idx])
+        bboxes_temp = BBoxRegressor(layer_input, regressions, dtype=dtype)
+        bboxes = jnp.append(bboxes, bboxes_temp, axis=0)
 
-    return outputs
+    # Return the regressions, classifications, and bboxes
+    return classifications, regressions, bboxes
 
 
 def create_retinanet(depth, **kwargs):
