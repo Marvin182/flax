@@ -46,9 +46,9 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
     A function, which takes in a single parameter, the global step in 
     the training process, and yields the current learning rate.
   """
-  assert total_steps > 0, "total_steps must be greater than 0"
-  assert warmup_steps >= 0, "total_steps must be greater than 0"
-  assert division_factor > .0, "division_factor must be positive"
+  assert training_steps > 0, "training_steps must be greater than 0"
+  assert warmup_steps >= 0, "warmup_steps must be greater than 0"
+  assert division_factor > 0.0, "division_factor must be positive"
 
   # Get the default values for learning rate decay
   if division_schedule is None:
@@ -58,7 +58,7 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
   division_schedule = jnp.sort(jnp.unique(division_schedule)) + warmup_steps
   
   # Define the decay function
-  def decay_fn(step: jnp.int) -> jnp.float:
+  def decay_fn(step: int) -> float:
     lr = lr / division_factor ** jnp.argmax(division_schedule > step)
 
     # Linearly increase the learning rate during warmup
@@ -362,12 +362,16 @@ def train_retinanet_model(train_data: jnp.array, test_data: jnp.array,
       dtype = jnp.bfloat16
     else:
       dtype = jnp.float16
+  print("HERE1")
 
   # Create the training entities, and replicate the state
   model, model_state = create_model(jax.random.PRNGKey(prng_seed), shape=shape, 
     classes=classes, depth=depth, dtype=dtype)
+  print("HERE1.1")
   optimizer = create_optimizer(model,  beta=0.9, weight_decay=0.0001)
+  print("HERE1.2")
   meta_state = CheckpointState(optimizer=optimizer, model_state=model_state)
+  print("HERE1.3")
   del model, model_state, optimizer  # Remove duplicate data
 
   # Try to restore the state of a previous run
