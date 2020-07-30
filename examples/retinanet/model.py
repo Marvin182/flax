@@ -318,9 +318,6 @@ class RetinaNet(flax.nn.Module):
     regression_subnet = RegressionSubnet.shared(anchor_values=anchor_values,
                                                 features=fpn_filters,
                                                 anchors=anchors, dtype=dtype)
-    anchor_unpacker = AnchorUnpacker.partial(ratios=anchors_config.ratios,
-                                             scales=anchors_config.scales,
-                                             dtype=dtype)
 
     # Obtain regresssions and classifications from P3 to P7
     bboxes = jnp.zeros((data.shape[0], 0, 4), dtype=dtype)
@@ -341,10 +338,14 @@ class RetinaNet(flax.nn.Module):
 
       # If not training, then expand the anchors and apply regressions
       if not train:
-        anchors = anchor_unpacker(layer_input.shape[:3], 
-                                  anchors_config.strides[idx],
-                                  anchors_config.sizes[idx])
-        bboxes_temp = BBoxRegressor(anchors, regressions_temp, dtype=dtype)
+        anchors = generate_anchors(layer_input.shape[:3], 
+                                   anchors_config.strides[idx],
+                                   anchors_config.sizes[idx],
+                                   anchors_config.ratios,
+                                   anchors_config.scales,
+                                   dtype)
+        bboxes_temp = apply_anchor_regressions(anchors, regressions_temp, 
+                                               dtype=dtype)
         bboxes = jnp.append(bboxes, bboxes_temp, axis=1)
 
     # Return the regressions, classifications, and bboxes
