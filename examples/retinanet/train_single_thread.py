@@ -59,10 +59,10 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
   
   # Define the decay function
   def decay_fn(step: int) -> float:
-    lr = lr / division_factor ** jnp.argmax(division_schedule > step)
+    lr = learning_rate / division_factor ** jnp.argmax(division_schedule > step)
 
     # Linearly increase the learning rate during warmup
-    return lr * jnp.minimum(1., epoch / warmup_epochs)
+    return lr * jnp.minimum(1., step / warmup_steps)
 
   return decay_fn
 
@@ -129,14 +129,14 @@ def _focal_loss(logits: jnp.array, label: int, anchor_type: int,
   Returns:
     The value of the Focal Loss for this anchor.
   """
-  if anchor_type == -1:
-    return 0
-  return -alpha * ((1 - logits[label]) ** gamma) * jnp.log(logits[label])
-focal_loss = jax.vmap(_focal_loss, in_axes=(0, 0, 0, None, None))
+  # Only consider foreground (1) and background (0) anchors for this loss
+  c = jnp.minimum(anchor_type + 1, 1)  
+  return c * -alpha * ((1 - logits[label]) ** gamma) * jnp.log(logits[label])
+focal_loss = jax.vmap(_focal_loss, in_axes=(0, 0, 0))
 
 
 @jax.vmap
-def _smooth_l1(regressions: jnp.array, targets: jnp.array, 
+def smooth_l1(regressions: jnp.array, targets: jnp.array, 
                anchor_type: int) -> float:
   """Implements the Smooth-L1 loss. 
 
@@ -148,11 +148,11 @@ def _smooth_l1(regressions: jnp.array, targets: jnp.array,
   Returns:
     The value of the Smooth-L1 loss for this anchor.
   """
-  if anchor_type != 1:
-    return 0
+  # Only consider foreground (1) anchors for this loss
+  c = jnp.maximum(anchor_type, 0)
   deltas = regressions - targets
-  return l * jnp.sum(jnp.where(jnp.absolute(deltas) < 1.0, 0.5 * deltas ** 2.0, 
-                     jnp.absolute(deltas) - 0.5))
+  return c * jnp.sum(jnp.where(jnp.absolute(deltas) < 1.0, 
+    0.5 * deltas ** 2.0, jnp.absolute(deltas) - 0.5))
 
 
 def _retinanet_loss(classifications: jnp.array, regressions: jnp.array, 
@@ -180,9 +180,9 @@ def _retinanet_loss(classifications: jnp.array, regressions: jnp.array,
   """
   valid_anchors = (anchor_types >= 0).sum()
   fl = focal_loss(classifications, classification_targets, anchor_types)
-  sl1 = smooth_l1(regressions, regression_targets, anchor_type)
+  sl1 = smooth_l1(regressions, regression_targets, anchor_types)
   return (fl + sl1 * reg_weight) / valid_anchors  
-retinanet_loss = jax.vmap(_retinanet_loss, in_axes=(0, 0, 0, 0, 0, None))
+retinanet_loss = jax.vmap(_retinanet_loss, in_axes=(0, 0, 0, 0, 0))
 
 
 def compute_metrics(classifications: jnp.array, regressions: jnp.array, 
@@ -312,7 +312,7 @@ def create_step_fn(lr_function):
     # Compute the gradients
     aux, grads = jax.value_and_grad(_loss_fn, has_aux=True)(
       meta_state.optimizer.target, meta_state.model_state)
-    new_model_state, pred = aux[1]
+    loss, new_model_state = aux
 
     # Apply the gradients to the model
     updated_optimizer = meta_state.optimizer.apply_gradient(
@@ -362,16 +362,12 @@ def train_retinanet_model(train_data: jnp.array, test_data: jnp.array,
       dtype = jnp.bfloat16
     else:
       dtype = jnp.float16
-  print("HERE1")
 
   # Create the training entities, and replicate the state
   model, model_state = create_model(jax.random.PRNGKey(prng_seed), shape=shape, 
     classes=classes, depth=depth, dtype=dtype)
-  print("HERE1.1")
   optimizer = create_optimizer(model,  beta=0.9, weight_decay=0.0001)
-  print("HERE1.2")
   meta_state = CheckpointState(optimizer=optimizer, model_state=model_state)
-  print("HERE1.3")
   del model, model_state, optimizer  # Remove duplicate data
 
   # Try to restore the state of a previous run

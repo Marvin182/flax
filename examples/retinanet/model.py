@@ -197,7 +197,6 @@ class RetinaNet(flax.nn.Module):
     feature_maps = {}
 
     # C1
-    print("Shape of the DATA:", data.shape)
     x = flax.nn.Conv(data, base_features, (7, 7), strides=(2, 2), bias=False,
                      name="init_conv", dtype=dtype)
     x = flax.nn.BatchNorm(x, use_running_average=(not train), momentum=0.9,
@@ -277,7 +276,7 @@ class RetinaNet(flax.nn.Module):
     return fpn_features
 
   def apply(self, data, depth=50, base_features=64, fpn_filters=256, anchors=9,
-            anchor_values=4, classes=1000, train=True, anchors_config=None,
+            anchor_values=4, classes=1000, train=True, anchors_config=None, 
             dtype=jnp.float32):
     """Applies the RetinaNet architecture.
 
@@ -345,7 +344,7 @@ class RetinaNet(flax.nn.Module):
         anchors = anchor_unpacker(layer_input.shape[:3], 
                                   anchors_config.strides[idx],
                                   anchors_config.sizes[idx])
-        bboxes_temp = BBoxRegressor(layer_input, regressions, dtype=dtype)
+        bboxes_temp = BBoxRegressor(anchors, regressions_temp, dtype=dtype)
         bboxes = jnp.append(bboxes, bboxes_temp, axis=1)
 
     # Return the regressions, classifications, and bboxes
