@@ -477,7 +477,7 @@ def read_data(prng_seed: int = 0):
   training and uses the rest of the validation data for testing.
 
   Args:
-     prng_seed: the seed to be used in the jax PRNG.
+     rng: JAX PRNGKey.
 
   Returns:
     A dictionary of the data, having the following shape:
@@ -502,8 +502,7 @@ def read_data(prng_seed: int = 0):
   """
   # Values according to https://www.tensorflow.org/datasets/catalog/coco
   VAL_SIZE = 5504
-  start = jax.random.randint(jax.random.PRNGKey(prng_seed), (1,), 0,
-                             VAL_SIZE)[0]
+  start = jax.random.randint(rng, (1,), 0, VAL_SIZE)[0]
   end = start + 35000
 
   # Read and prepare the data
@@ -531,7 +530,10 @@ def read_data(prng_seed: int = 0):
   return data
 
 
-def prepare_data(data: tf.data.Dataset, per_device_batch_size: int) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
+def prepare_data(
+    data: tf.data.Dataset,
+    per_device_batch_size: int,
+    distributed_training: bool = True) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
   """Process a COCO dataset, and produce training and testing input pipelines.
 
   Args:
@@ -577,12 +579,5 @@ def prepare_data(data: tf.data.Dataset, per_device_batch_size: int) -> Tuple[tf.
       batch_preprocessor(), num_parallel_calls=autotune)
   for batch_size in reversed(batch_dims):
     test = test.batch(batch_size, drop_remainder=True)
-
-  # Create iterators for train and test
-  def _prepare_split(x):
-    return tfds.as_numpy(x)
-
-  train = map(_prepare_split, train)
-  test = map(_prepare_split, test)
 
   return train, test

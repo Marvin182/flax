@@ -1,11 +1,15 @@
-from input_pipeline import prepare_data
-from model import create_retinanet
-from flax.training import checkpoints
-from jax import numpy as jnp
-
-import flax
-import jax
 import math
+
+from absl import logging
+import flax
+from flax.training import checkpoints
+import jax
+import jax.numpy as jnp
+import tensorflow as tf
+import tensorflow_datasets as tfds
+
+import input_pipeline
+from model import create_retinanet
 
 
 def create_scheduled_decay_fn(learning_rate: float, training_steps: int, 
@@ -54,25 +58,24 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
   return decay_fn
 
 
-def create_model(rng, depth=50, classes=1000, shape=(224, 224, 3), dtype=jnp.float32):
+def create_model(rng, depth=50, classes=1000, shape=(224, 224, 3)):
   """Creates a RetinaNet model.
 
   Args:
     rng: the Jax PRNG, which is used to instantiate the model weights
     depth: the depth of the basckbone network
     classes: the number of classes in the object detection task
-    shape: the shape of the image inputs, with the format (H, W, C)
-    dtype: the data type of the model
+    shape: the shape of the image inputs, with the format (N, H, W, C)
 
   Returns:
     The RetinaNet instance, and its state object
   """
   # The number of classes is increased by 1 since we add the background
-  partial_module = create_retinanet(depth, classes=classes + 1, dtype=dtype)
+  partial_module = create_retinanet(depth, classes=classes + 1)
 
   # Since the BatchNorm has state, we'll need to use stateful here
   with flax.nn.stateful() as init_state:
-    _, params = partial_module.init(rng, jnp.zeros((1,) + shape))
+    _, params = partial_module.init_by_shape(rng, [(shape, jnp.float32)])
 
   return flax.nn.Model(partial_module, params), init_state
 
@@ -272,69 +275,55 @@ def create_step_fn(lr_function):
   return take_step
 
 
-def train_retinanet_model(train_data: jnp.array, test_data: jnp.array, 
-                          shape: list, classes: int = 80, depth: int = 50, 
-                          learning_rate: float = 0.1, batch_size: int = 64, 
-                          training_steps: int = 90000,
-                          warmup_steps: int = 30000, 
-                          try_restore: bool = True, 
-                          half_precision: bool = False,
-                          checkpoint_period: int = 20000,
-                          prng_seed: int = 0) -> CheckpointState:
-  """This method trains a RetinaNet instance.
+def train_and_evaluate(config, workdir: str):
+  """Runs a training and evaluation loop.
 
   Args:
-    train_data: a generator yielding batches of `batch_size`
-    test_data: a generator yielding batches of `batch_size`
-    shape: the shape of the padded images
-    classes: the number of classes in the object detection task
-    depth: the number of layers in the RetinaNet backbone
-    learning_rate: the base learning rate for the training process
-    batch_size: the batch size
-    training_steps: the number of training steps
-    warmup_steps: the number of warmup steps
-    try_restore: indicates if the latest checkpoint should be restored
-    half_precision: indicates if half-precision floating points should be used
-    checkpoint_period: the frequency in steps for checkpointing the model
-
-  Returns:
-    A `CheckpointState` object containing the trained model. 
+    config: Configuration to use.
+    workdir: Working directory for checkpoints and TF summaries. If this
+      contains checkpoint training will be resumed from the latest checkpoint.
   """
-  assert 0 == batch_size % jax.local_device_count(), "batch_size must be " \
-                                                     "divisible by the number" \
-                                                     " of local devices"
+  tf.io.gfile.makedirs(workdir)
+
+  # Deterministic training, see go/deterministic training.
+  rng = jax.random.PRNGKey(config.seed)
+
+  if config.batch_size % jax.device_count():
+    raise ValueError(f"Batch_size ({config.batch_size}) must be divisible by "
+        f"the number of devices {jax.device_count}).")
+
   # Set up the data pipeline
-  train_data, val_data = prepare_data(data, batch_size=batch_size)
-  train_iter = iter(train_data)
+  dataset_builder = tfds.builder("coco/2014")
+  num_classes = dataset_builder.info.features["objects"]["label"].num_classes
+  rng, data_rng = jax.random.split(rng)
+  data = input_pipeline.read_data(data_rng)
+  train_data, val_data = input_pipeline.prepare_data(data, per_device_batch_size=config.batch_size // jax.device_count())
+  logging.info("Training data shapes: %s", train_data.element_spec)
+  input_shape = list(train_data.element_spec["image"].shape)[1:]
+  # train_iter = iter(train_data)
 
   # Crate the training parameters
-  steps_per_epoch = int(math.ceil(data['train']['count'] / batch_size))
-  steps_per_eval = int(math.ceil(data['test']['count'] / batch_size))
-  total_step_count = epochs * steps_per_epoch
-
-  # Set the correct dtype
-  dtype = jnp.float32
-  if half_precision:
-    if jax.local_devices()[0].platform == 'tpu':
-      dtype = jnp.bfloat16
-    else:
-      dtype = jnp.float16
+  steps_per_epoch = int(math.ceil(data['train']['count'] / config.batch_size))
+  steps_per_eval = int(math.ceil(data['test']['count'] / config.batch_size))
 
   # Create the training entities, and replicate the state
-  model, model_state = create_model(jax.random.PRNGKey(prng_seed), shape=shape, 
-    classes=classes, depth=depth, dtype=dtype)
+  rng, model_rng = jax.random.split(rng)
+  model, model_state = create_model(model_rng, shape=input_shape,
+    classes=num_classes, depth=config.depth)
   optimizer = create_optimizer(model,  beta=0.9, weight_decay=0.0001)
-  meta_state = CheckpointState(optimizer=optimizer, model_state=model_state)
+  meta_state = CheckpointState(optimizer=optimizer, model_state=model_state, step=0)
   del model, model_state, optimizer  # Remove duplicate data
 
   # Try to restore the state of a previous run
-  meta_state = restore_checkpoint(meta_state) if try_restore else meta_state
+  # meta_state = restore_checkpoint(meta_state) if try_restore else meta_state
+
+  initial_step = int(state.step) + 1
 
   # Replicate the state across devices
-  meta_state = flax.jax_utils.replicate(meta_state)  
+  meta_state = flax.jax_utils.replicate(meta_state)
 
   # Prepare the LR scheduler
-  learning_rate *= batch_size / 256
+  learning_rate *= config.batch_size / 256
   learning_rate_fn = create_decay_fn(learning_rate, training_steps, 
                                      warmup_steps)
 
@@ -344,18 +333,17 @@ def train_retinanet_model(train_data: jnp.array, test_data: jnp.array,
   p_eval_fn = jax.pmap(eval, axis_name="device")
 
   # Run the training loop
-  for epoch in range(start_epoch, epochs):
-    step_offset = epoch * steps_per_epoch
+  for step in range(initial_step, config.num_train_steps + 1):
+    # Use ._numpy() to avoid copy.
+    batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
+    meta_state, metrics = p_step_fn(batch, meta_state)
 
-    # Run an epoch
-    for step in range(steps_per_epoch):
-      # Use ._numpy() to avoid copy.
-      batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
-      meta_state, metrics = p_step_fn(batch, meta_state)
-      if step % 10 == 0:
-        single_metric = jax.tree_map(lambda x: x[0], metrics)
-        print("(Train Step #{}) Log Loss: {}".format(
-          step + step_offset, single_metric))
+    # Quick indication that training is happening.
+    logging.log_first_n(logging.INFO, "Finished training step %d.", 5, step)
+
+    if step > 4:
+      return
+    continue
 
     # Sync up the model_state after every epoch
     meta_state = sync_model_state(meta_state)
