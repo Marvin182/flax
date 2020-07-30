@@ -18,7 +18,7 @@ class CheckpointState:
   # The optimizer, which also holds the model
   optimizer : flax.optim.Optimizer
   # The global state of this checkpoint
-  step : int = -1
+  step : int = 0
 
 
 def create_scheduled_decay_fn(learning_rate: float, training_steps: int, 
@@ -386,8 +386,9 @@ def train_retinanet_model(train_data: jnp.array, test_data: jnp.array,
   for step in range(start_step, warmup_steps + training_steps):
     batch = next(train_data)
     meta_state, loss = step_fn(batch, meta_state)
-    if step % 10 == 0:
-      print("(Train Step #{}) RetinaNet Loss: {}".format(step, loss))
+    print(f"(Train Step #{step}) RetinaNet Loss: {loss}")
+    # if step % 10 == 0:
+    #   print("(Train Step #{}) RetinaNet Loss: {}".format(step, loss))
 
     # Evaluate and checkpoint the model
     if step % checkpoint_period == 0:
@@ -400,6 +401,6 @@ def train_retinanet_model(train_data: jnp.array, test_data: jnp.array,
         results = eval(batch, meta_state)
         eval_results.append(results)
       eval_results = aggregate_evals(eval_results)
-      print("(Epoch #{}) Evaluation results:\n".format(epoch), eval_results)
+      print(f"(Epoch #{epoch}) Evaluation results: {eval_results}\n")
 
   return meta_state
