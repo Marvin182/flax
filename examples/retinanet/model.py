@@ -197,6 +197,7 @@ class RetinaNet(flax.nn.Module):
     feature_maps = {}
 
     # C1
+    print("Shape of the DATA:", data.shape)
     x = flax.nn.Conv(data, base_features, (7, 7), strides=(2, 2), bias=False,
                      name="init_conv", dtype=dtype)
     x = flax.nn.BatchNorm(x, use_running_average=(not train), momentum=0.9,
