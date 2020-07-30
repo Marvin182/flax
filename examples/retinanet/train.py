@@ -37,7 +37,7 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
     A function, which takes in a single parameter, the global step in 
     the training process, and yields the current learning rate.
   """
-  assert total_steps > 0, "total_steps must be greater than 0"
+  assert training_steps > 0, "training_steps must be greater than 0"
   assert warmup_steps >= 0, "total_steps must be greater than 0"
   assert division_factor > .0, "division_factor must be positive"
 
@@ -300,7 +300,7 @@ def train_and_evaluate(config, workdir: str):
   train_data, val_data = input_pipeline.prepare_data(data, per_device_batch_size=config.batch_size // jax.device_count())
   logging.info("Training data shapes: %s", train_data.element_spec)
   input_shape = list(train_data.element_spec["image"].shape)[1:]
-  # train_iter = iter(train_data)
+  train_iter = iter(train_data)
 
   # Crate the training parameters
   steps_per_epoch = int(math.ceil(data['train']['count'] / config.batch_size))
@@ -317,15 +317,15 @@ def train_and_evaluate(config, workdir: str):
   # Try to restore the state of a previous run
   # meta_state = restore_checkpoint(meta_state) if try_restore else meta_state
 
-  initial_step = int(state.step) + 1
+  initial_step = int(meta_state.step) + 1
 
   # Replicate the state across devices
   meta_state = flax.jax_utils.replicate(meta_state)
 
   # Prepare the LR scheduler
-  learning_rate *= config.batch_size / 256
-  learning_rate_fn = create_decay_fn(learning_rate, training_steps, 
-                                     warmup_steps)
+  learning_rate = config.learning_rate * config.batch_size / 256
+  learning_rate_fn = create_scheduled_decay_fn(
+      learning_rate, config.num_train_steps, config.warmup_steps)
 
   # Prepare the training loop for distributed runs
   step_fn = create_step_fn(learning_rate_fn)
