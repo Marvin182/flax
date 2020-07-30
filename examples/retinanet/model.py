@@ -335,9 +335,9 @@ class RetinaNet(flax.nn.Module):
       regressions_temp = regression_subnet(layer_input)
       classifications_temp = classification_subnet(layer_input) 
 
-      regressions = jnp.append(regressions, regressions_temp, axis=0)
+      regressions = jnp.append(regressions, regressions_temp, axis=1)
       classifications = jnp.append(classifications, classifications_temp, 
-                                   axis=0)
+                                   axis=1)
 
       # If not training, then expand the anchors and apply regressions
       if not train:
@@ -345,7 +345,7 @@ class RetinaNet(flax.nn.Module):
                                   anchors_config.strides[idx],
                                   anchors_config.sizes[idx])
         bboxes_temp = BBoxRegressor(layer_input, regressions, dtype=dtype)
-        bboxes = jnp.append(bboxes, bboxes_temp, axis=0)
+        bboxes = jnp.append(bboxes, bboxes_temp, axis=1)
 
     # Return the regressions, classifications, and bboxes
     return classifications, regressions, bboxes
