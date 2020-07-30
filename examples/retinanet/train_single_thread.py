@@ -132,7 +132,7 @@ def _focal_loss(logits: jnp.array, label: int, anchor_type: int,
   if anchor_type == -1:
     return 0
   return -alpha * ((1 - logits[label]) ** gamma) * jnp.log(logits[label])
-focal_loss = jax.vmap(_focal_loss, in_axes=[0, 0, 0, None, None])
+focal_loss = jax.vmap(_focal_loss, in_axes=(0, 0, 0, None, None))
 
 
 @jax.vmap
@@ -182,7 +182,7 @@ def _retinanet_loss(classifications: jnp.array, regressions: jnp.array,
   fl = focal_loss(classifications, classification_targets, anchor_types)
   sl1 = smooth_l1(regressions, regression_targets, anchor_type)
   return (fl + sl1 * reg_weight) / valid_anchors  
-retinanet_loss = jax.vmap(_retinanet_loss, in_axes=[0] * 5 + [None])
+retinanet_loss = jax.vmap(_retinanet_loss, in_axes=(0, 0, 0, 0, 0, None))
 
 
 def compute_metrics(classifications: jnp.array, regressions: jnp.array, 

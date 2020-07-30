@@ -2,6 +2,7 @@ from anchor import generate_all_anchors, AnchorConfig
 from flax import jax_utils
 from jax import numpy as jnp
 from os import getenv
+from typing import Tuple
 from util import tf_jaccard_index
 
 import itertools
@@ -544,32 +545,44 @@ def prepare_data(data: tf.data.Dataset, per_device_batch_size: int) -> Tuple[tf.
         },
         "test": {
             "count": <test_example_count>,
-            "data": <test_data>
-        }
-      }
-      ```
-    per_device_batch_size: The batch size per device (GPU or TPU core).
-      E.g. per_device_batch_size = global_batch_size // jax.device_count().
+            "data": <test_data> } } ```
+    per_device_batch_size: The batch size per device (GPU or TPU core). E.g.
+      per_device_batch_size = global_batch_size // jax.device_count().
+    distributed_training: True if the data is prepare for distributed training,
+      and hence will require an additional dimension for the number of devices
 
   Returns:
     A tuple containing the preprocessed datasets for training and testing.
   """
-  autotune = tf.data.experimental.AUTOTUNE
 
   # Create wrapped pre-processing methods
   batch_preprocessor = DataPreprocessor()
+  autotune = tf.data.experimental.AUTOTUNE
+
+  # Define the relevant leading dimensions for the batch
+  if distributed_training:
+    batch_dims = [jax.local_device_count(), per_device_batch_size]
+  else:
+    batch_dims = [per_device_batch_size]
 
   # Prepare training data: standardize, resize and randomly flip the images
-  train = data["train"]["data"].repeat().shuffle(batch_size * 16, seed=0).map(
-    batch_preprocessor(augment_image=True), num_parallel_calls=autotune)
-  batch_dims = [jax.local_device_count(), per_device_batch_size]
-  for batch_size in reversed(batch_dimes):
+  train = data["train"]["data"].repeat().shuffle(
+      per_device_batch_size * 16, seed=0).map(
+          batch_preprocessor(augment_image=True), num_parallel_calls=autotune)
+  for batch_size in reversed(batch_dims):
     train = train.batch(batch_size, drop_remainder=True)
 
   # Prepare the test data: only standardize and resize
-  test = data["test"]["data"].map(batch_preprocessor(), 
-                                  num_parallel_calls=autotune)
-  for batch_size in reversed(batch_dimes):
+  test = data["test"]["data"].map(
+      batch_preprocessor(), num_parallel_calls=autotune)
+  for batch_size in reversed(batch_dims):
     test = test.batch(batch_size, drop_remainder=True)
+
+  # Create iterators for train and test
+  def _prepare_split(x):
+    return tfds.as_numpy(x)
+
+  train = map(_prepare_split, train)
+  test = map(_prepare_split, test)
 
   return train, test
