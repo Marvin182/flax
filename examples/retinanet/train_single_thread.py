@@ -114,7 +114,8 @@ def create_optimizer(model: flax.nn.Model, optimizer: str = "momentum",
   return optimizer_def.create(model)
 
 
-def _focal_loss(logits: jnp.array, label: int, anchor_type: int, 
+@jax.vmap
+def focal_loss(logits: jnp.array, label: int, anchor_type: int, 
                alpha: float = 0.25, gamma: float = 2.0) -> float:
   """Implements the Focal Loss.
 
@@ -132,7 +133,7 @@ def _focal_loss(logits: jnp.array, label: int, anchor_type: int,
   # Only consider foreground (1) and background (0) anchors for this loss
   c = jnp.minimum(anchor_type + 1, 1)  
   return c * -alpha * ((1 - logits[label]) ** gamma) * jnp.log(logits[label])
-focal_loss = jax.vmap(_focal_loss, in_axes=(0, 0, 0))
+# focal_loss = jax.vmap(_focal_loss, in_axes=(0, 0, 0))
 
 
 @jax.vmap
@@ -155,7 +156,8 @@ def smooth_l1(regressions: jnp.array, targets: jnp.array,
     0.5 * deltas ** 2.0, jnp.absolute(deltas) - 0.5))
 
 
-def _retinanet_loss(classifications: jnp.array, regressions: jnp.array, 
+@jax.vmap
+def retinanet_loss(classifications: jnp.array, regressions: jnp.array, 
                     anchor_types: jnp.array, classification_targets: jnp.array, 
                     regression_targets: jnp.array, 
                     reg_weight: float = 1.0) -> float:
@@ -178,11 +180,12 @@ def _retinanet_loss(classifications: jnp.array, regressions: jnp.array,
   Returns:
     The image loss given by the RetinaNet loss function.
   """
-  valid_anchors = (anchor_types >= 0).sum()
+  valid_anchors = jnp.sum(anchor_types >= 0)
   fl = focal_loss(classifications, classification_targets, anchor_types)
   sl1 = smooth_l1(regressions, regression_targets, anchor_types)
-  return (fl + sl1 * reg_weight) / valid_anchors  
-retinanet_loss = jax.vmap(_retinanet_loss, in_axes=(0, 0, 0, 0, 0))
+  print(f"Focal loss:\n > FL={fl}\n > SL1={sl1}")
+  return jnp.sum(fl + sl1 * reg_weight) / valid_anchors  
+# retinanet_loss = jax.vmap(_retinanet_loss, in_axes=(0, 0, 0, 0, 0))
 
 
 def compute_metrics(classifications: jnp.array, regressions: jnp.array, 
@@ -299,11 +302,12 @@ def create_step_fn(lr_function):
     def _loss_fn(model: flax.nn.Model, state: flax.nn.Collection):
       with flax.nn.stateful(state) as new_state:
         classifications, regressions, _ = model(data['image'])
-      loss = jnp.mean(retinanet_loss(classifications, regressions, 
-                                     data['anchor_type'],
-                                     data['classification_labels'],
-                                     data['regression_targets']))
-
+      loss = retinanet_loss(classifications, regressions, data['anchor_type'], 
+                            data['classification_labels'], 
+                            data['regression_targets'])
+      print("Raw loss: ", loss)
+      loss = jnp.mean(loss)
+      print("Mean loss:", loss)
       return loss, new_state
 
     # flax.struct.dataclass is immutable, so unwrap it
@@ -327,15 +331,14 @@ def create_step_fn(lr_function):
   return take_step
 
 
-def train_retinanet_model(train_data: jnp.array, test_data: jnp.array, 
-                          shape: list, classes: int = 80, depth: int = 50, 
-                          learning_rate: float = 0.1, batch_size: int = 64, 
-                          training_steps: int = 90000,
+def train_retinanet_model(rng: jnp.array, train_data: jnp.array, 
+                          test_data: jnp.array, shape: list, classes: int = 80, 
+                          depth: int = 50, learning_rate: float = 0.1, 
+                          batch_size: int = 64, training_steps: int = 90000,
                           warmup_steps: int = 30000, 
                           try_restore: bool = True, 
                           half_precision: bool = False,
-                          checkpoint_period: int = 20000,
-                          prng_seed: int = 0) -> CheckpointState:
+                          checkpoint_period: int = 20000) -> CheckpointState:
   """This method trains a RetinaNet instance.
 
   Args:
@@ -364,8 +367,9 @@ def train_retinanet_model(train_data: jnp.array, test_data: jnp.array,
       dtype = jnp.float16
 
   # Create the training entities, and replicate the state
-  model, model_state = create_model(jax.random.PRNGKey(prng_seed), shape=shape, 
-    classes=classes, depth=depth, dtype=dtype)
+  rng, rng_input = jax.random.split(rng)
+  model, model_state = create_model(rng_input, shape=shape, classes=classes, 
+                                    depth=depth, dtype=dtype)
   optimizer = create_optimizer(model,  beta=0.9, weight_decay=0.0001)
   meta_state = CheckpointState(optimizer=optimizer, model_state=model_state)
   del model, model_state, optimizer  # Remove duplicate data
@@ -383,8 +387,10 @@ def train_retinanet_model(train_data: jnp.array, test_data: jnp.array,
   step_fn = create_step_fn(learning_rate_fn)
 
   # Run the training loop
+  train_iter = iter(train_data)
+  test_iter = iter(test_data)
   for step in range(start_step, warmup_steps + training_steps):
-    batch = next(train_data)
+    batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
     meta_state, loss = step_fn(batch, meta_state)
     print(f"(Train Step #{step}) RetinaNet Loss: {loss}")
     # if step % 10 == 0:
@@ -393,11 +399,11 @@ def train_retinanet_model(train_data: jnp.array, test_data: jnp.array,
     # Evaluate and checkpoint the model
     if step % checkpoint_period == 0:
       epoch = step // checkpoint_period
-      checkpoint_state(meta_state, epoch)
+      # checkpoint_state(meta_state, epoch)
       
       eval_results = []
       for _ in range(100):
-        batch = next(test_data)
+        batch = jax.tree_map(lambda x: x._numpy(), next(test_iter))  # pylint: disable=protected-access
         results = eval(batch, meta_state)
         eval_results.append(results)
       eval_results = aggregate_evals(eval_results)

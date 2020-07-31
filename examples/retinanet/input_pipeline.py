@@ -471,7 +471,7 @@ class DataPreprocessor:
     return _inner
 
 
-def read_data(prng_seed: int = 0):
+def read_data(rng):
   """
   Reads the `COCO/2014` dataset and creates a `trainval35k` subset for
   training and uses the rest of the validation data for testing.
@@ -533,7 +533,7 @@ def read_data(prng_seed: int = 0):
 def prepare_data(
     data: tf.data.Dataset,
     per_device_batch_size: int,
-    distributed_training: bool,
+    distributed_training: bool = True,
     shape: Iterable[int] = None
     ) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
   """Process a COCO dataset, and produce training and testing input pipelines.
@@ -554,7 +554,8 @@ def prepare_data(
       per_device_batch_size = global_batch_size // jax.device_count().
     distributed_training: True if the data is prepare for distributed training,
       and hence will require an additional dimension for the number of devices
-    shape: an iterable data structure of two elements: height and width
+    shape: an iterable data structure of two elements: min side size, and
+      max size side
 
   Returns:
     A tuple containing the preprocessed datasets for training and testing.
