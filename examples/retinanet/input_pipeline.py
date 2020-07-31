@@ -2,7 +2,7 @@ from anchor import generate_all_anchors, AnchorConfig
 from flax import jax_utils
 from jax import numpy as jnp
 from os import getenv
-from typing import Tuple
+from typing import Iterable, Tuple
 from util import tf_jaccard_index
 
 import itertools
@@ -533,7 +533,9 @@ def read_data(prng_seed: int = 0):
 def prepare_data(
     data: tf.data.Dataset,
     per_device_batch_size: int,
-    distributed_training: bool = True) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
+    distributed_training: bool,
+    shape: Iterable[int] = None
+    ) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
   """Process a COCO dataset, and produce training and testing input pipelines.
 
   Args:
@@ -552,13 +554,16 @@ def prepare_data(
       per_device_batch_size = global_batch_size // jax.device_count().
     distributed_training: True if the data is prepare for distributed training,
       and hence will require an additional dimension for the number of devices
+    shape: an iterable data structure of two elements: height and width
 
   Returns:
     A tuple containing the preprocessed datasets for training and testing.
   """
+  if not shape:
+    shape = (600, 1000)
 
   # Create wrapped pre-processing methods
-  batch_preprocessor = DataPreprocessor()
+  batch_preprocessor = DataPreprocessor(min_size=shape[0], max_size=shape[1])
   autotune = tf.data.experimental.AUTOTUNE
 
   # Define the relevant leading dimensions for the batch
