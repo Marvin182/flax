@@ -27,7 +27,7 @@ def get_config():
 
   config.learning_rate = 0.1
   config.batch_size = 64
-  config.num_train_steps = 90_000,
+  config.num_train_steps = 90_000
   config.warmup_steps = 30_000
 
   # The number of layers in the RetinaNet backbone.

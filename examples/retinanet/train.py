@@ -12,8 +12,8 @@ import input_pipeline
 from model import create_retinanet
 
 
-def create_scheduled_decay_fn(learning_rate: float, training_steps: int, 
-                              warmup_steps: int, division_factor:float = 10.0,
+def create_scheduled_decay_fn(learning_rate: float, *, num_train_steps: int,
+                              warmup_steps: int, division_factor: float = 10.0,
                               division_schedule: list = None):
   """Creates a scheduled division based learning rate decay function.
 
@@ -25,7 +25,7 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
 
   Args:
     learning_rate: the base learning rate
-    training_steps: the number of training steps 
+    num_train_steps: the number of training steps 
     warmup_steps: the number of warmup steps 
     division_factor: the factor by which the learning rate is divided at the 
       training steps indicated by `division_schedule`
@@ -37,17 +37,17 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
     A function, which takes in a single parameter, the global step in 
     the training process, and yields the current learning rate.
   """
-  assert training_steps > 0, "training_steps must be greater than 0"
+  assert num_train_steps > 0, "num_train_steps must be greater than 0"
   assert warmup_steps >= 0, "total_steps must be greater than 0"
   assert division_factor > .0, "division_factor must be positive"
 
   # Get the default values for learning rate decay
   if division_schedule is None:
-    division_schedule = [int(training_steps * .66), int(training_steps * .88)]
+    division_schedule = [int(num_train_steps * .66), int(num_train_steps * .88)]
 
   # Adjust the schedule to not consider the warmup steps
   division_schedule = jnp.sort(jnp.unique(division_schedule)) + warmup_steps
-  
+
   # Define the decay function
   def decay_fn(step):
     lr = lr / division_factor ** jnp.argmax(division_schedule > step)
@@ -134,7 +134,7 @@ def compute_metrics(pred, labels):
   return jax.lax.pmean(metrics, "device")
 
 
-def eval(data, meta_state):
+def eval_step(data, meta_state):
   """Evaluates the model.
 
   The evaluation is done against the Log-loss and the Accuracy
@@ -325,17 +325,19 @@ def train_and_evaluate(config, workdir: str):
   # Prepare the LR scheduler
   learning_rate = config.learning_rate * config.batch_size / 256
   learning_rate_fn = create_scheduled_decay_fn(
-      learning_rate, config.num_train_steps, config.warmup_steps)
+      learning_rate, num_train_steps=config.num_train_steps, warmup_steps=config.warmup_steps)
 
   # Prepare the training loop for distributed runs
   step_fn = create_step_fn(learning_rate_fn)
   p_step_fn = jax.pmap(step_fn, axis_name="device")
-  p_eval_fn = jax.pmap(eval, axis_name="device")
+  p_eval_fn = jax.pmap(eval_step, axis_name="device")
 
   # Run the training loop
+  logging.info("Starting training loop at step %d.", initial_step)
   for step in range(initial_step, config.num_train_steps + 1):
     # Use ._numpy() to avoid copy.
     batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
+    logging.info("Get input batch for step %d.", step)
     meta_state, metrics = p_step_fn(batch, meta_state)
 
     # Quick indication that training is happening.
@@ -343,6 +345,8 @@ def train_and_evaluate(config, workdir: str):
 
     if step > 4:
       return
+
+    print("Sipping eval and checkpointing. Let's get the loss go down first.")
     continue
 
     # Sync up the model_state after every epoch
