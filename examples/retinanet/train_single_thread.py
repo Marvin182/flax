@@ -133,7 +133,6 @@ def focal_loss(logits: jnp.array, label: int, anchor_type: int,
   # Only consider foreground (1) and background (0) anchors for this loss
   c = jnp.minimum(anchor_type + 1, 1)  
   return c * -alpha * ((1 - logits[label]) ** gamma) * jnp.log(logits[label])
-# focal_loss = jax.vmap(_focal_loss, in_axes=(0, 0, 0))
 
 
 @jax.vmap
@@ -183,9 +182,9 @@ def retinanet_loss(classifications: jnp.array, regressions: jnp.array,
   valid_anchors = jnp.sum(anchor_types >= 0)
   fl = focal_loss(classifications, classification_targets, anchor_types)
   sl1 = smooth_l1(regressions, regression_targets, anchor_types)
-  print(f"Focal loss:\n > FL={fl}\n > SL1={sl1}")
+  # print(f"Focal loss:\n > FL={fl}\n > SL1={sl1}")
+  # return fl, sl1 
   return jnp.sum(fl + sl1 * reg_weight) / valid_anchors  
-# retinanet_loss = jax.vmap(_retinanet_loss, in_axes=(0, 0, 0, 0, 0))
 
 
 def compute_metrics(classifications: jnp.array, regressions: jnp.array, 
@@ -239,7 +238,7 @@ def aggregate_evals(eval_array):
 
   count = len(eval_array)
   for k in accumulator:
-    count[k] /= count
+    accumulator[k] /= count
 
   return accumulator 
 
@@ -302,12 +301,39 @@ def create_step_fn(lr_function):
     def _loss_fn(model: flax.nn.Model, state: flax.nn.Collection):
       with flax.nn.stateful(state) as new_state:
         classifications, regressions, _ = model(data['image'])
-      loss = retinanet_loss(classifications, regressions, data['anchor_type'], 
-                            data['classification_labels'], 
-                            data['regression_targets'])
-      print("Raw loss: ", loss)
-      loss = jnp.mean(loss)
-      print("Mean loss:", loss)
+
+      # [TODO]: Check if classifications or regressions are inf, check if labels are inf as well
+
+      # print("Classification Len:", classifications.shape)
+      # print("Regression Len:", regressions.shape)
+
+      # print("Classification NaNs: ", jnp.isnan(classifications).sum())
+      # print("Classification Inf: ", jnp.isinf(classifications).sum())
+      # print("Regression NaNs: ", jnp.isnan(regressions).sum())
+      # print("Regression Inf: ", jnp.isinf(regressions).sum())
+
+      # print("Labels Len: ", data['classification_labels'].shape)
+      # print("Reg Targets: ", data['regression_targets'].shape)
+
+      # print("Labels NaNs: ", jnp.isnan(data['classification_labels']).sum())
+      # print("Labels Inf: ", jnp.isinf(data['classification_labels']).sum())
+      # print("Reg Targets NaNs: ", jnp.isnan(data['classification_labels']).sum())
+      # print("Reg Targets Inf: ", jnp.isinf(data['regression_targets']).sum())
+
+      # fl, sl = retinanet_loss(classifications, regressions, data['anchor_type'], 
+      #                         data['classification_labels'], 
+      #                         data['regression_targets'])
+
+      # print(" > Raw loss:", fl, sl)
+      # print(" > Max value in loss:", jnp.amax(fl), jnp.amax(sl))
+      # print(" > Any NaNs:", jnp.isnan(fl).sum(), jnp.isnan(sl).sum())
+      # print(" > Any Infs:", jnp.isinf(fl).sum(), jnp.isinf(sl).sum())
+      # print(" > Mean loss:", jnp.mean(fl), jnp.mean(sl))
+
+      loss = jnp.mean(retinanet_loss(classifications, regressions, data['anchor_type'], 
+                                     data['classification_labels'], 
+                                     data['regression_targets']))
+
       return loss, new_state
 
     # flax.struct.dataclass is immutable, so unwrap it

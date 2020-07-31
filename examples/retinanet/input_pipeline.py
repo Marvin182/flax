@@ -59,7 +59,8 @@ class DataPreprocessor:
     # Convert to tensor for the rest of the preprocessing
     self.all_anchors = tf.convert_to_tensor(self.all_anchors)
 
-  def get_clipped_anchors(self, height, width):
+  @staticmethod
+  def get_clipped_anchors(anchors: tf.Tensor, height: float, width: float):
     """Clips and returns the base anchors.
 
     More specifically, the x coordinates of the base anchors are clipped, 
@@ -67,6 +68,8 @@ class DataPreprocessor:
     the `y` coordinates are always found in the `[0, height]` interval.
 
     Args:
+      anchors: a tensor of the shape (|A|, 5) where the last column is reserved 
+        for the anchor type
       height: the true height of the image
       width: the true width of the image
 
@@ -74,9 +77,6 @@ class DataPreprocessor:
       A matrix of the form (|A|, 5), which contains the clipped anchors, as well
       as an extra column which can be used to store the status of the anchor.
     """
-    # Copy the base anchors; thsese should have 5 columns
-    anchors = tf.identity(self.all_anchors)
-
     # Clip the anchor coordinates
     x1 = tf.math.minimum(tf.math.maximum(anchors[:, 0], 0.0), width)
     y1 = tf.math.minimum(tf.math.maximum(anchors[:, 1], 0.0), height)
@@ -333,12 +333,15 @@ class DataPreprocessor:
           training, only the foreground anchors should be considered.
     """
     # Copy to avoid recomputing
-    anchors = self.get_clipped_anchors(height, width)
-    # anchors = tf.identity(self.all_anchors)
+    anchors = tf.identity(self.all_anchors)
 
-    # Find the inner anchors
+    # Find the inner anchors, clip them, and find their overlaps
     in_idx, out_idx = self.filter_outer_anchors(anchors, [height, width])
     in_anchors = tf.gather(anchors, in_idx)
+    in_anchors = self.get_clipped_anchors(in_anchors, height, width)
+    anchors = tf.tensor_scatter_nd_update(anchors, tf.expand_dims(in_idx, 1), 
+                                          in_anchors)
+
     overlaps = self.compute_anchor_overlaps(in_anchors, bboxes)
     foreground_idx, ignored_idx, argmax = self.compute_foreground_ignored(
       overlaps)
