@@ -159,7 +159,8 @@ class DataPreprocessor:
     image = tf.image.flip_left_right(image)
     bboxes = tf.map_fn(
       lambda x: tf.convert_to_tensor([x[0], 1.0 - x[3], x[2], 1.0 - x[1]], 
-      dtype=tf.float32), bboxes)
+        dtype=tf.float32),
+      bboxes, fn_output_signature=tf.TensorSpec(4, dtype=tf.float32))
     return image, bboxes
 
   @staticmethod
@@ -235,7 +236,8 @@ class DataPreprocessor:
     bboxes = tf.tile(bboxes, [anchor_count, 1])
     
     # Compute the overlaps
-    overlaps = tf.map_fn(tf_jaccard_index, (anchors, bboxes), dtype=tf.float32)
+    overlaps = tf.map_fn(tf_jaccard_index, (anchors, bboxes), 
+                         fn_output_signature=tf.float32)
     return tf.reshape(overlaps, [anchor_count, bbox_count])
 
   def compute_foreground_ignored(self, overlaps : tf.Tensor):
@@ -303,7 +305,7 @@ class DataPreprocessor:
     targets = tf.transpose(tf.stack([dx1, dy1, dx2, dy2]))
     return  (targets - self.bbox_mean) / self.bbox_std
 
-  def compute_anchors_and_labels(self, bboxes, height, width):
+  def compute_anchors_and_labels(self, bboxes, labels, height, width):
     """Computes the anchors, their type, as well as their targets.
 
     More specifically, this method will compute all the anchors within the 
@@ -315,6 +317,8 @@ class DataPreprocessor:
     Args:
       bboxes: a tensor for the shape `(|B|, 4)`, which holds the ground truth
         bounding boxes of the image
+      labels: a tensor of length `|B|`, storing the label of each ground truth
+        bounding box
       height: the height of the true image within the padded image
       width: the width of the true image within the padded image
 
@@ -372,8 +376,10 @@ class DataPreprocessor:
         tf.shape(out_idx)[0], dtype=tf.float32) * -1.0)
 
     # Compute the classification targets
+    label_idx = tf.expand_dims(argmax, axis=1)
+    classification_labels = tf.gather_nd(labels, label_idx)
     indices = tf.expand_dims(in_idx[:, 0], 1)
-    classification_labels = tf.scatter_nd(indices, argmax, 
+    classification_labels = tf.scatter_nd(indices, classification_labels, 
       (tf.shape(anchors)[0],))
 
     # Prepare the regression target computation
@@ -460,7 +466,8 @@ class DataPreprocessor:
 
       # Perform anchor specific operations: filtering, IoU, and labelling
       anchors, classification_labels, regression_targets = \
-        self.compute_anchors_and_labels(bboxes, new_image_h, new_image_w)
+        self.compute_anchors_and_labels(bboxes, labels, new_image_h, 
+                                        new_image_w)
 
       # Return the preprocessed batch
       return {
@@ -472,6 +479,10 @@ class DataPreprocessor:
         "regression_targets": regression_targets
       }
     return _inner
+
+
+def is_annotated(data):
+  return tf.math.greater(tf.size(data["objects"]["label"]), 0)
 
 
 def read_data(rng):
@@ -577,14 +588,14 @@ def prepare_data(
     batch_dims = [per_device_batch_size]
 
   # Prepare training data: standardize, resize and randomly flip the images
-  train = data["train"]["data"].repeat().shuffle(
+  train = data["train"]["data"].filter(is_annotated).repeat().shuffle(
       per_device_batch_size * 16, seed=0).map(
           batch_preprocessor(augment_image=True), num_parallel_calls=autotune)
   for batch_size in reversed(batch_dims):
     train = train.batch(batch_size, drop_remainder=True)
 
   # Prepare the test data: only standardize and resize
-  test = data["test"]["data"].map(
+  test = data["test"]["data"].filter(is_annotated).map(
       batch_preprocessor(), num_parallel_calls=autotune)
   for batch_size in reversed(batch_dims):
     test = test.batch(batch_size, drop_remainder=True)

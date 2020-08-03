@@ -182,8 +182,6 @@ def retinanet_loss(classifications: jnp.array, regressions: jnp.array,
   valid_anchors = jnp.sum(anchor_types >= 0)
   fl = focal_loss(classifications, classification_targets, anchor_types)
   sl1 = smooth_l1(regressions, regression_targets, anchor_types)
-  # print(f"Focal loss:\n > FL={fl}\n > SL1={sl1}")
-  # return fl, sl1 
   return jnp.sum(fl + sl1 * reg_weight) / valid_anchors  
 
 
@@ -301,36 +299,8 @@ def create_step_fn(lr_function):
     def _loss_fn(model: flax.nn.Model, state: flax.nn.Collection):
       with flax.nn.stateful(state) as new_state:
         classifications, regressions, _ = model(data['image'])
-
-      # [TODO]: Check if classifications or regressions are inf, check if labels are inf as well
-
-      # print("Classification Len:", classifications.shape)
-      # print("Regression Len:", regressions.shape)
-
-      # print("Classification NaNs: ", jnp.isnan(classifications).sum())
-      # print("Classification Inf: ", jnp.isinf(classifications).sum())
-      # print("Regression NaNs: ", jnp.isnan(regressions).sum())
-      # print("Regression Inf: ", jnp.isinf(regressions).sum())
-
-      # print("Labels Len: ", data['classification_labels'].shape)
-      # print("Reg Targets: ", data['regression_targets'].shape)
-
-      # print("Labels NaNs: ", jnp.isnan(data['classification_labels']).sum())
-      # print("Labels Inf: ", jnp.isinf(data['classification_labels']).sum())
-      # print("Reg Targets NaNs: ", jnp.isnan(data['classification_labels']).sum())
-      # print("Reg Targets Inf: ", jnp.isinf(data['regression_targets']).sum())
-
-      # fl, sl = retinanet_loss(classifications, regressions, data['anchor_type'], 
-      #                         data['classification_labels'], 
-      #                         data['regression_targets'])
-
-      # print(" > Raw loss:", fl, sl)
-      # print(" > Max value in loss:", jnp.amax(fl), jnp.amax(sl))
-      # print(" > Any NaNs:", jnp.isnan(fl).sum(), jnp.isnan(sl).sum())
-      # print(" > Any Infs:", jnp.isinf(fl).sum(), jnp.isinf(sl).sum())
-      # print(" > Mean loss:", jnp.mean(fl), jnp.mean(sl))
-
-      loss = jnp.mean(retinanet_loss(classifications, regressions, data['anchor_type'], 
+      loss = jnp.mean(retinanet_loss(classifications, regressions, 
+                                     data['anchor_type'], 
                                      data['classification_labels'], 
                                      data['regression_targets']))
 
@@ -419,11 +389,9 @@ def train_retinanet_model(rng: jnp.array, train_data: jnp.array,
     batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
     meta_state, loss = step_fn(batch, meta_state)
     print(f"(Train Step #{step}) RetinaNet Loss: {loss}")
-    # if step % 10 == 0:
-    #   print("(Train Step #{}) RetinaNet Loss: {}".format(step, loss))
 
     # Evaluate and checkpoint the model
-    if step % checkpoint_period == 0:
+    if step % checkpoint_period == 0 and step != 0:
       epoch = step // checkpoint_period
       # checkpoint_state(meta_state, epoch)
       
