@@ -18,19 +18,58 @@ class DataPreprocessor:
   """This class handles data preprocessing for object detection tasks.
   """
 
-  def __init__(self, min_size=600, max_size=1000, foreground_t=0.5, 
-               ignore_t=0.4, mean=None, std_dev=None, bbox_mean=None, 
-               bbox_std=None, anchor_config : AnchorConfig = None):
+  def __init__(self, min_size: int = 600, max_size: int = 1000, 
+               foreground_t: float = 0.5, ignore_t: float = 0.4, 
+               mean: Iterable[float] = None, std_dev: Iterable[float] = None, 
+               bbox_mean: Iterable[float] = None, 
+               bbox_std: Iterable[float] = None, label_shift: int = 0, 
+               anchor_config : AnchorConfig = None):
+    """Initializes a DataPreprocessor object which handles data preprocessing.
+
+    Args:
+      min_size: after resizing, the image should have the shorter side equal to 
+        `min_size`; this may not happen when scaling towards `min_size` while 
+        maintaining the aspect ratio implies that the longer size will exceed 
+        `max_size`  
+      max_size: the maximal allowed size for the longer side of the original 
+        image after resizing; if the resized image exceeds `max_size`, it is 
+        scaled down such that the longer size is equal to `max_size`
+      foreground_t: a float in the range `[0, 1]` indicating a lower bound 
+        (inclusive) for an anchor's maximal overlap with a ground truth 
+        bounding box, such that the anchor is considered as foreground 
+        and assigned a label and regression targets
+      ignore_t: a float in the range `[0, foreground_t]` indicating the lower 
+        bound (inclusive) of the maximal overlap of an anchor with a ground 
+        truth bounding box. If the anchor's overlap is within the range 
+        `[ignore_t, foreground_t)`, then the anchor is excluded from learning. 
+        Note that when `ignore_t == foreground_t`, no anchor will be ignored.
+      mean: a 3 element iterable, containing the means of the initial 3 image
+        channels; this parameter is used for standardization
+      std_dev: a 3 element iterable, containing the standard deviations of 
+        the initial 3 image channels; this parameter is used for standardization
+      bbox_mean: a 4 element iterable, containing the means of the 4 values 
+        defining an anchor regression target; this parameter is used for 
+        regression target standardization
+      bbox_std: a 4 element iterable, containing the standard deviations of 
+        the 4 values defining an anchor regression target; this parameter is 
+        used for regression target standardization
+      label_shift: a scalar used for shifting the ground truth labels; this 
+        value is especially useful when trying to include token labels in the 
+        data preprocessing pipeline, such as `0` for background 
+      anchor_config: an AnchorConfig object, which contains the relevant
+        information for statically unpacking the anchors in a fixed size image. 
+    """
     assert min_size > 0 and max_size > 0 and min_size <= max_size, \
       "The following requirement is violated: 0 < min_size <= max_size"
-    assert foreground_t > 0 and ignore_t > 0 and ignore_t <= foreground_t, \
-      "The following requirement is violated: 0 < ignore_t <= foreground_t"
+    assert 1.0 >= foreground_t >= 0.0 and ignore_t >= 0.0 and \
+      ignore_t <= foreground_t, "The following requirement is violated: " \
+      "0.0 <= ignore_t <= foreground_t <= 1.0"
 
     self.min_size = min_size
     self.max_size = max_size
     self.foreground_t = foreground_t
     self.ignore_t = ignore_t
-
+    self.label_shift = label_shift 
 
     # Create the mean and std deviation constants for regression standardization
     if bbox_mean is None:
@@ -441,7 +480,7 @@ class DataPreprocessor:
       # Unpack the dataset elements
       image = data["image"]
       is_crowd = data["objects"]["is_crowd"]
-      labels = data["objects"]["label"]
+      labels = data["objects"]["label"] + self.label_shift
       bboxes = data["objects"]["bbox"]
       bbox_count = tf.shape(bboxes)[0]
 
@@ -482,6 +521,15 @@ class DataPreprocessor:
 
 
 def is_annotated(data):
+  """Predicate which identifies images with annotations.
+
+  Args:
+    data: a data instance in the context of object detection as provided by
+      TFDS
+  
+  Returns:
+    True if the instance has annotations, False otherwise. 
+  """
   return tf.math.greater(tf.size(data["objects"]["label"]), 0)
 
 
@@ -577,8 +625,9 @@ def prepare_data(
   if not shape:
     shape = (600, 1000)
 
-  # Create wrapped pre-processing methods
-  batch_preprocessor = DataPreprocessor(min_size=shape[0], max_size=shape[1])
+  # Note: we shift the labels by 1 since 0 is reserved for background
+  batch_preprocessor = DataPreprocessor(min_size=shape[0], max_size=shape[1], 
+                                        label_shift=1)
   autotune = tf.data.experimental.AUTOTUNE
 
   # Define the relevant leading dimensions for the batch
