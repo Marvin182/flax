@@ -10,7 +10,7 @@ import math
 
 
 @flax.struct.dataclass
-class CheckpointState:
+class State:
   """A dataclass which stores the state of the training loop.
   """
   # The state variable of the model
@@ -209,7 +209,7 @@ def compute_metrics(classifications: jnp.array, regressions: jnp.array,
   return metrics
 
 
-def eval(data: jnp.array, meta_state: CheckpointState) -> Dict[str, float]:
+def eval(data: jnp.array, meta_state: State) -> Dict[str, float]:
   """Evaluates the model.
 
   The evaluation is done against the Log-loss and the Accuracy
@@ -217,7 +217,7 @@ def eval(data: jnp.array, meta_state: CheckpointState) -> Dict[str, float]:
 
   Args:
     data: the test data
-    model: an instance of the CheckpointState class
+    model: an instance of the `State` class
 
   Returns:
     The accuracy and the Log-loss aggregated across multiple workers.
@@ -241,12 +241,12 @@ def aggregate_evals(eval_array):
   return accumulator 
 
 
-def checkpoint_state(meta_state: CheckpointState, checkpoint_step: int,
+def checkpoint_state(meta_state: State, checkpoint_step: int,
                      checkpoint_dir: str = "checkpoints") -> None:
   """Checkpoints the training state.
 
   Args:
-    meta_state: a `CheckpointState` object, which contains the state of
+    meta_state: a `State` object, which contains the state of
       the current training step
     checkpoint_step: a checkpoint step, used for versioning the checkpoint
     checkpoint_dir: the directory where the checkpoint is stored
@@ -254,8 +254,8 @@ def checkpoint_state(meta_state: CheckpointState, checkpoint_step: int,
   checkpoints.save_checkpoint(checkpoint_dir, meta_state, checkpoint_step)
 
 
-def restore_checkpoint(meta_state: CheckpointState, 
-                       checkpoint_dir: str = "checkpoints") -> CheckpointState:
+def restore_checkpoint(meta_state: State, 
+                       checkpoint_dir: str = "checkpoints") -> State:
   """Restores the latest checkpoint.
 
   More specifically, either returns the latest checkpoint from the
@@ -263,7 +263,7 @@ def restore_checkpoint(meta_state: CheckpointState,
   exists.
 
   Args:
-    meta_state: a `CheckpointState` object, used as last resort if no checkpoint
+    meta_state: a `State` object, used as last resort if no checkpoint
       exists
     checkpoint_dir: the directory where the checkpoints are searched for
 
@@ -282,19 +282,19 @@ def create_step_fn(lr_function):
 
   Returns:
     A function responsible with carrying out a training step. The function takes
-    in two arguments: the batch, and a `CheckpointState` object, which
+    in two arguments: the batch, and a `State` object, which
     stores the current training state.
   """
   def take_step(data: Mapping[str, jnp.array], 
-                meta_state: CheckpointState) -> Tuple[CheckpointState, Any]:
+                meta_state: State) -> Tuple[State, Any]:
     """Trains the model on a batch and returns the updated model.
 
     Args:
       data: the batch on which the pass is performed
-      meta_state: a `CheckpointState` object, which holds the current model
+      meta_state: a `State` object, which holds the current model
 
     Returns:
-      The updated model as a `CheckpointState` object and the batch's loss
+      The updated model as a `State` object and the batch's loss
     """
     def _loss_fn(model: flax.nn.Model, state: flax.nn.Collection):
       with flax.nn.stateful(state) as new_state:
@@ -334,7 +334,7 @@ def train_retinanet_model(rng: jnp.array, train_data: jnp.array,
                           warmup_steps: int = 30000, 
                           try_restore: bool = True, 
                           half_precision: bool = False,
-                          checkpoint_period: int = 20000) -> CheckpointState:
+                          checkpoint_period: int = 20000) -> State:
   """This method trains a RetinaNet instance.
 
   Args:
@@ -352,7 +352,7 @@ def train_retinanet_model(rng: jnp.array, train_data: jnp.array,
     checkpoint_period: the frequency in steps for checkpointing the model
 
   Returns:
-    A `CheckpointState` object containing the trained model. 
+    A `State` object containing the trained model. 
   """
   # Set the correct dtype based on the platform being used
   dtype = jnp.float32
@@ -367,7 +367,7 @@ def train_retinanet_model(rng: jnp.array, train_data: jnp.array,
   model, model_state = create_model(rng_input, shape=shape, classes=classes, 
                                     depth=depth, dtype=dtype)
   optimizer = create_optimizer(model,  beta=0.9, weight_decay=0.0001)
-  meta_state = CheckpointState(optimizer=optimizer, model_state=model_state)
+  meta_state = State(optimizer=optimizer, model_state=model_state)
   del model, model_state, optimizer  # Remove duplicate data
 
   # Try to restore the state of a previous run
@@ -384,7 +384,6 @@ def train_retinanet_model(rng: jnp.array, train_data: jnp.array,
 
   # Run the training loop
   train_iter = iter(train_data)
-  test_iter = iter(test_data)
   for step in range(start_step, warmup_steps + training_steps):
     batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
     meta_state, loss = step_fn(batch, meta_state)
@@ -396,6 +395,7 @@ def train_retinanet_model(rng: jnp.array, train_data: jnp.array,
       # checkpoint_state(meta_state, epoch)
       
       eval_results = []
+      test_iter = iter(test_data)
       for _ in range(100):
         batch = jax.tree_map(lambda x: x._numpy(), next(test_iter))  # pylint: disable=protected-access
         results = eval(batch, meta_state)

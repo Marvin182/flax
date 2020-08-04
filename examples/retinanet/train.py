@@ -7,16 +7,27 @@ import jax
 import jax.numpy as jnp
 import tensorflow as tf
 import tensorflow_datasets as tfds
+from typing import Iterable
 
 import input_pipeline
 from model import create_retinanet
 
 
-def create_scheduled_decay_fn(learning_rate: float,
-                              *,
-                              num_train_steps: int,
-                              warmup_steps: int,
-                              division_factor: float = 10.0,
+
+@flax.struct.dataclass
+class State:
+  """A dataclass which stores the state of the training loop.
+  """
+  # The state variable of the model
+  model_state : flax.nn.Collection
+  # The optimizer, which also holds the model
+  optimizer : flax.optim.Optimizer
+  # The global state of this checkpoint
+  step : int = 0
+
+
+def create_scheduled_decay_fn(learning_rate: float, training_steps: int, 
+                              warmup_steps: int, division_factor:float = 10.0,
                               division_schedule: list = None):
   """Creates a scheduled division based learning rate decay function.
 
@@ -28,7 +39,7 @@ def create_scheduled_decay_fn(learning_rate: float,
 
   Args:
     learning_rate: the base learning rate
-    num_train_steps: the number of training steps 
+    training_steps: the number of training steps 
     warmup_steps: the number of warmup steps 
     division_factor: the factor by which the learning rate is divided at the 
       training steps indicated by `division_schedule`
@@ -40,28 +51,30 @@ def create_scheduled_decay_fn(learning_rate: float,
     A function, which takes in a single parameter, the global step in 
     the training process, and yields the current learning rate.
   """
-  assert num_train_steps > 0, "num_train_steps must be greater than 0"
-  assert warmup_steps >= 0, "total_steps must be greater than 0"
-  assert division_factor > .0, "division_factor must be positive"
+  assert training_steps > 0, "training_steps must be greater than 0"
+  assert warmup_steps >= 0, "warmup_steps must be greater than 0"
+  assert division_factor > 0.0, "division_factor must be positive"
 
   # Get the default values for learning rate decay
   if division_schedule is None:
-    division_schedule = [int(num_train_steps * .66), int(num_train_steps * .88)]
+    division_schedule = [int(training_steps * .66), int(training_steps * .88)]
 
   # Adjust the schedule to not consider the warmup steps
   division_schedule = jnp.sort(jnp.unique(division_schedule)) + warmup_steps
-
+  
   # Define the decay function
-  def decay_fn(step):
-    lr = lr / division_factor**jnp.argmax(division_schedule > step)
+  def decay_fn(step: int) -> float:
+    lr = learning_rate / division_factor ** jnp.argmax(division_schedule > step)
 
     # Linearly increase the learning rate during warmup
-    return lr * jnp.minimum(1., epoch / warmup_epochs)
+    return lr * jnp.minimum(1., step / warmup_steps)
 
   return decay_fn
 
 
-def create_model(rng, depth=50, classes=1000, shape=(224, 224, 3)):
+def create_model(rng: jnp.ndarray, depth: int = 50, classes: int = 1000, 
+                 shape: Iterable[int] = (224, 224, 3), 
+                 dtype: jnp.dtype = jnp.float32) -> flax.nn.Model:
   """Creates a RetinaNet model.
 
   Args:
@@ -69,16 +82,18 @@ def create_model(rng, depth=50, classes=1000, shape=(224, 224, 3)):
     depth: the depth of the basckbone network
     classes: the number of classes in the object detection task
     shape: the shape of the image inputs, with the format (N, H, W, C)
+    dtype: the data type of the model
 
   Returns:
     The RetinaNet instance, and its state object
   """
   # The number of classes is increased by 1 since we add the background
-  partial_module = create_retinanet(depth, classes=classes + 1)
+  partial_module = create_retinanet(depth, classes=classes + 1, dtype=dtype)
 
   # Since the BatchNorm has state, we'll need to use stateful here
   with flax.nn.stateful() as init_state:
-    _, params = partial_module.init_by_shape(rng, [(shape, jnp.float32)])
+    # _, params = partial_module.init(rng, jnp.zeros(shape))
+    _, params = partial_module.init_by_shape(rng, input_specs=[(shape, jnp.float32)]) 
 
   return flax.nn.Model(partial_module, params), init_state
 
@@ -130,8 +145,11 @@ def compute_metrics(pred, labels):
   """
   cross_entropy = jnp.mean(cross_entropy_loss(pred, labels))
   accuracy = jnp.mean(jnp.argmax(pred, axis=1) == labels)
-  metrics = {"accuracy": accuracy, "cross_entropy": cross_entropy}
-  return jax.lax.pmean(metrics, "device")
+  metrics = {
+    "accuracy": accuracy,
+    "cross_entropy": cross_entropy
+  }
+  return jax.lax.pmean(metrics, "batch")
 
 
 def eval_step(data, meta_state):
@@ -142,7 +160,7 @@ def eval_step(data, meta_state):
 
   Args:
     data: the test data
-    model: an instance of the CheckpointState class
+    model: an instance of the State class
 
   Returns:
     The accuracy and the Log-loss aggregated across multiple workers.
@@ -157,26 +175,13 @@ def aggregate_evals(eval_array):
   return dict(zip(eval_array[0].keys(), jnp.mean(vals, axis=0)))
 
 
-@flax.struct.dataclass
-class CheckpointState:
-  """A dataclass which stores the state of the training loop.
-  """
-  # The state variable of the model
-  model_state: flax.nn.Collection
-  # The optimizer, which also holds the model
-  optimizer: flax.optim.Optimizer
-  # The global state of this checkpoint
-  step: int = -1
-
-
-def checkpoint_state(meta_state: CheckpointState,
-                     checkpoint_step: int,
+def checkpoint_state(meta_state : State, checkpoint_step : int,
                      checkpoint_dir="checkpoints"):
   """
   Checkpoints the training state.
 
   Args:
-    meta_state: a `CheckpointState` object, which contains the state of
+    meta_state: a `State` object, which contains the state of
       the current training step
     checkpoint_step: a checkpoint step, used for versioning the checkpoint
     checkpoint_dir: the directory where the checkpoint is stored
@@ -194,7 +199,7 @@ def restore_checkpoint(meta_state, checkpoint_dir="checkpoints"):
   exists.
 
   Args:
-    meta_state: a `CheckpointState` object, used as last resort if no checkpoint
+    meta_state: a `State` object, used as last resort if no checkpoint
       does exist
     checkpoint_dir: the directory where the checkpoints are searched for
 
@@ -208,10 +213,10 @@ def sync_model_state(meta_state):
   """Synchronizes the model_state across devices.
 
   Args:
-    meta_state: a `CheckpointState` object to be used towards synchronization
+    meta_state: a `State` object to be used towards synchronization
 
   Returns:
-    A new CheckpointState object with an updated `model_state` field.
+    A new State object with an updated `model_state` field.
   """
   mean = jax.pmap(lambda x: jax.lax.pmean(x, 'axis'), 'axis')
   return meta_state.replace(model_state=mean(meta_state.model_state))
@@ -226,19 +231,18 @@ def create_step_fn(lr_function):
 
   Returns:
     A function responsible with carrying out a training step. The function takes
-    in two arguments: the batch, and a `CheckpointState` object, which
+    in two arguments: the batch, and a `State` object, which
     stores the current training state.
   """
-
-  def take_step(data, meta_state: CheckpointState):
+  def take_step(data, meta_state: State):
     """Trains the model on a batch and returns the updated model.
 
     Args:
       data: the batch on which the pass is performed
-      meta_state: a `CheckpointState` object, which holds the current model
+      meta_state: a `State` object, which holds the current model
 
     Returns:
-      The updated model as a `CheckpointState` object and the batch's loss
+      The updated model as a `State` object and the batch's loss
     """
 
     def _loss_fn(model, state):
@@ -265,7 +269,7 @@ def create_step_fn(lr_function):
     metrics = compute_metrics(pred, data['label'])
 
     # Synchronize device model across devices
-    grads = jax.lax.pmean(grads, "device")
+    grads = jax.lax.pmean(grads, "batch")
 
     # Apply the gradients to the model
     updated_optimizer = meta_state.optimizer.apply_gradient(
@@ -286,16 +290,12 @@ def train_and_evaluate(config, workdir: str):
   Args:
     config: Configuration to use.
     workdir: Working directory for checkpoints and TF summaries. If this
-      contains checkpoint training will be resumed from the latest checkpoint.
+      contains checkpoint, training will be resumed from the latest checkpoint.
   """
   tf.io.gfile.makedirs(workdir)
 
   # Deterministic training, see go/deterministic training.
   rng = jax.random.PRNGKey(config.seed)
-
-  if config.batch_size % jax.device_count():
-    raise ValueError(f"Batch_size ({config.batch_size}) must be divisible by "
-                     f"the number of devices {jax.device_count}).")
 
   # Set up the data pipeline
   dataset_builder = tfds.builder("coco/2014")
@@ -303,48 +303,45 @@ def train_and_evaluate(config, workdir: str):
   rng, data_rng = jax.random.split(rng)
   data = input_pipeline.read_data(data_rng)
   train_data, val_data = input_pipeline.prepare_data(
-      data, per_device_batch_size=config.batch_size // jax.device_count())
+    data, per_device_batch_size=config.per_device_batch_size, 
+    distributed_training=config.distributed_training, 
+    shape=[config.img_min_side, config.img_max_side])
+
   logging.info("Training data shapes: %s", train_data.element_spec)
   input_shape = list(train_data.element_spec["image"].shape)[1:]
-  train_iter = iter(train_data)
-
-  # Crate the training parameters
-  steps_per_epoch = int(math.ceil(data['train']['count'] / config.batch_size))
-  steps_per_eval = int(math.ceil(data['test']['count'] / config.batch_size))
 
   # Create the training entities, and replicate the state
   rng, model_rng = jax.random.split(rng)
-  model, model_state = create_model(
-      model_rng, shape=input_shape, classes=num_classes, depth=config.depth)
-  optimizer = create_optimizer(model, beta=0.9, weight_decay=0.0001)
-  meta_state = CheckpointState(
-      optimizer=optimizer, model_state=model_state, step=0)
-  del model, model_state, optimizer  # Remove duplicate data
+  model, model_state = create_model(model_rng, shape=input_shape,
+    classes=num_classes, depth=config.depth, dtype=config.dtype)
+  optimizer = create_optimizer(model,  beta=0.9, weight_decay=0.0001)
+  meta_state = State(optimizer=optimizer, model_state=model_state)
+  del model, model_state, optimizer
 
-  # Try to restore the state of a previous run
-  # meta_state = restore_checkpoint(meta_state) if try_restore else meta_state
-
-  initial_step = int(meta_state.step) + 1
+   # Try to restore the state of a previous run 
+  if config.try_restore:
+    meta_state = restore_checkpoint(meta_state)
+  start_step = meta_state.step
 
   # Replicate the state across devices
   meta_state = flax.jax_utils.replicate(meta_state)
 
   # Prepare the LR scheduler
-  learning_rate = config.learning_rate * config.batch_size / 256
+  learning_rate = config.learning_rate * config.per_device_batch_size / 256
   learning_rate_fn = create_scheduled_decay_fn(
-      learning_rate,
-      num_train_steps=config.num_train_steps,
-      warmup_steps=config.warmup_steps)
+      learning_rate, config.num_train_steps, config.warmup_steps)
 
   # Prepare the training loop for distributed runs
   step_fn = create_step_fn(learning_rate_fn)
-  p_step_fn = jax.pmap(step_fn, axis_name="device")
-  p_eval_fn = jax.pmap(eval_step, axis_name="device")
+  p_step_fn = jax.pmap(step_fn, axis_name="batch")
+  p_eval_fn = jax.pmap(eval_step, axis_name="batch")
+
+  return 
 
   # Run the training loop
+  train_iter = iter(train_data)
   logging.info("Starting training loop at step %d.", initial_step)
   for step in range(initial_step, config.num_train_steps + 1):
-    # Use ._numpy() to avoid copy.
     batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
     logging.info("Get input batch for step %d.", step)
     meta_state, metrics = p_step_fn(batch, meta_state)

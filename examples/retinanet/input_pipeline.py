@@ -623,8 +623,8 @@ def prepare_data(
       per_device_batch_size = global_batch_size // jax.device_count().
     distributed_training: True if the data is prepare for distributed training,
       and hence will require an additional dimension for the number of devices
-    shape: an iterable data structure of two elements: min side size, and max
-      size side
+    shape: an iterable data structure of two elements: `[min_side_size,
+      max_side_size]` specified in pixels
 
   Returns:
     A tuple containing the preprocessed datasets for training and testing.
@@ -640,12 +640,14 @@ def prepare_data(
   # Define the relevant leading dimensions for the batch
   if distributed_training:
     batch_dims = [jax.local_device_count(), per_device_batch_size]
+    device_count = batch_dims[0]
   else:
+    device_count = 1
     batch_dims = [per_device_batch_size]
 
   # Prepare training data: standardize, resize and randomly flip the images
   train = data["train"]["data"].filter(is_annotated).repeat().shuffle(
-      per_device_batch_size * 16, seed=0).map(
+      device_count * per_device_batch_size * 16, seed=0).map(
           batch_preprocessor(augment_image=True), num_parallel_calls=autotune)
   for batch_size in reversed(batch_dims):
     train = train.batch(batch_size, drop_remainder=True)
