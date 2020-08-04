@@ -13,7 +13,12 @@ class ClassificationSubnet(flax.nn.Module):
   at each level of the FPN. Follows: https://arxiv.org/pdf/1708.02002.pdf.
   """
 
-  def apply(self, x, classes=1000, features=256, anchors=9, pi=0.01,
+  def apply(self,
+            x,
+            classes=1000,
+            features=256,
+            anchors=9,
+            pi=0.01,
             dtype=jnp.float32):
     """Applies the classification subnet from the RetinaNet architecture.
 
@@ -30,8 +35,8 @@ class ClassificationSubnet(flax.nn.Module):
       each row describes an anchor's probability of identifying objects
     """
     # Prepare the partial conv required in the subnet
-    conv = flax.nn.Conv.partial(kernel_size=(3, 3), strides=(1, 1),
-                                kernel_init=normal(), dtype=dtype)
+    conv = flax.nn.Conv.partial(
+        kernel_size=(3, 3), strides=(1, 1), kernel_init=normal(), dtype=dtype)
 
     # The actual logic of the subnet
     for i in range(4):
@@ -51,7 +56,11 @@ class RegressionSubnet(flax.nn.Module):
   each level of the FPN. Follows: https://arxiv.org/pdf/1708.02002.pdf
   """
 
-  def apply(self, x, anchor_values=4, anchors=9, features=256,
+  def apply(self,
+            x,
+            anchor_values=4,
+            anchors=9,
+            features=256,
             dtype=jnp.float32):
     """Applies the regression subnet from the RetinaNet architecture.
 
@@ -69,8 +78,8 @@ class RegressionSubnet(flax.nn.Module):
       to be applied to the anchor boxes: [dx1, dy1, dx2, dy2].
     """
     # Prepare the partial modules required for the subnet
-    conv = flax.nn.Conv.partial(kernel_size=(3, 3), strides=(1, 1),
-                                kernel_init=normal(), dtype=dtype)
+    conv = flax.nn.Conv.partial(
+        kernel_size=(3, 3), strides=(1, 1), kernel_init=normal(), dtype=dtype)
 
     # The actual logic of the subnet
     for i in range(4):
@@ -91,7 +100,11 @@ class BottleneckBlock(flax.nn.Module):
   # This constant indicates the depth expansion applied on the last layer
   block_expansion = 4
 
-  def apply(self, data, filters, train=True, downsample=False,
+  def apply(self,
+            data,
+            filters,
+            train=True,
+            downsample=False,
             dtype=jnp.float32):
     """Implements the logic of a ResNet Bottleneck block.
 
@@ -111,16 +124,21 @@ class BottleneckBlock(flax.nn.Module):
     # Declare the partial modules
     final_filters = self.block_expansion * filters
     conv = flax.nn.Conv.partial(dtype=dtype, bias=False)
-    batch_norm = flax.nn.BatchNorm.partial(use_running_average=(not train),
-                                           momentum=0.9, epsilon=1e-5,
-                                           dtype=dtype)
+    batch_norm = flax.nn.BatchNorm.partial(
+        use_running_average=(not train),
+        momentum=0.9,
+        epsilon=1e-5,
+        dtype=dtype)
 
     # Process the residual such that it is compatible with the final addition
     residual = data
     mid_strides = (1, 1) if not downsample else (2, 2)
     if downsample or residual.shape[-1] != final_filters:
-      residual = conv(data, final_filters, (1, 1), strides=mid_strides,
-                      name="downsample_conv")
+      residual = conv(
+          data,
+          final_filters, (1, 1),
+          strides=mid_strides,
+          name="downsample_conv")
       residual = batch_norm(residual, name="downsample_bn")
 
     # First 'layer'
@@ -149,11 +167,7 @@ class RetinaNet(flax.nn.Module):
   """
 
   # Maps to the number of blocks in the ResNet, relative to the model's depth
-  depths = {
-    50: [3, 4, 6, 3],
-    101: [3, 4, 23, 3],
-    156: [3, 8, 36, 3]
-  }
+  depths = {50: [3, 4, 6, 3], 101: [3, 4, 23, 3], 156: [3, 8, 36, 3]}
 
   def _nn_upsample(a, shape):
     """This method does nearest neighbor single octave upsampling on the input.
@@ -172,10 +186,10 @@ class RetinaNet(flax.nn.Module):
       dimension.
     """
     upsampled = jnp.repeat(a, 2, axis=0).repeat(2, axis=1)
-    return jax.lax.dynamic_slice(upsampled, [0, 0, 0], 
+    return jax.lax.dynamic_slice(upsampled, [0, 0, 0],
                                  [shape[0], shape[1], shape[2]])
-  nn_upsample = staticmethod(jax.vmap(_nn_upsample, in_axes=(0, None)))
 
+  nn_upsample = staticmethod(jax.vmap(_nn_upsample, in_axes=(0, None)))
 
   def _bottom_up_phase(self, data, train, base_features, layers, dtype):
     """Implements the backbone architecture.
@@ -197,24 +211,34 @@ class RetinaNet(flax.nn.Module):
     feature_maps = {}
 
     # C1
-    x = flax.nn.Conv(data, base_features, (7, 7), strides=(2, 2), bias=False,
-                     name="init_conv", dtype=dtype)
-    x = flax.nn.BatchNorm(x, use_running_average=(not train), momentum=0.9,
-                          epsilon=1e-5, name="init_bn", dtype=dtype)
+    x = flax.nn.Conv(
+        data,
+        base_features, (7, 7),
+        strides=(2, 2),
+        bias=False,
+        name="init_conv",
+        dtype=dtype)
+    x = flax.nn.BatchNorm(
+        x,
+        use_running_average=(not train),
+        momentum=0.9,
+        epsilon=1e-5,
+        name="init_bn",
+        dtype=dtype)
     x = flax.nn.relu(x)
     x = flax.nn.max_pool(x, (3, 3), strides=(2, 2), padding="SAME")
 
     # C2 to C5
     for block_idx in range(len(layers)):
-      block = BottleneckBlock.partial(filters=base_features * 2 ** block_idx,
-                                      train=train, dtype=dtype)
+      block = BottleneckBlock.partial(
+          filters=base_features * 2**block_idx, train=train, dtype=dtype)
 
       start_idx = 0
       # From C2 and onward, the first block implies downsampling
       if block_idx > 0:
         start_idx = 1
-        x = block(x, downsample=True, name="bottleneck_{}_{}".format(
-          block_idx, 0))
+        x = block(
+            x, downsample=True, name="bottleneck_{}_{}".format(block_idx, 0))
 
       # The other blocks do not imply downsampling
       for rep in range(start_idx, layers[block_idx]):
@@ -250,33 +274,47 @@ class RetinaNet(flax.nn.Module):
     conv = flax.nn.Conv.partial(features=filters, strides=(1, 1), dtype=dtype)
 
     # Create the supplementary feature maps P6 and P7
-    fpn_features["P6"] = flax.nn.Conv(backbone_features["C5"], filters, (3, 3),
-                                      strides=(2, 2), dtype=dtype,
-                                      name="fpn_conv_p6")
+    fpn_features["P6"] = flax.nn.Conv(
+        backbone_features["C5"],
+        filters, (3, 3),
+        strides=(2, 2),
+        dtype=dtype,
+        name="fpn_conv_p6")
     x = flax.nn.relu(fpn_features["P6"])
-    fpn_features["P7"] = flax.nn.Conv(x, filters, (3, 3), strides=(2, 2),
-                                      dtype=dtype, name="fpn_conv_p7")
+    fpn_features["P7"] = flax.nn.Conv(
+        x, filters, (3, 3), strides=(2, 2), dtype=dtype, name="fpn_conv_p7")
 
     # Create the feature map for P5
-    x = conv(backbone_features["C5"], kernel_size=(1, 1),
-             name="lateral_conv_p5")
-    fpn_features["P5"] = conv(x, kernel_size=(3, 3),
-                              name="antialiasing_conv_p5")
+    x = conv(
+        backbone_features["C5"], kernel_size=(1, 1), name="lateral_conv_p5")
+    fpn_features["P5"] = conv(
+        x, kernel_size=(3, 3), name="antialiasing_conv_p5")
 
     # Create the feature maps P4 and P3
     for i in [4, 3]:
-      lateral = conv(backbone_features["C{}".format(i)], kernel_size=(1, 1),
-                     name="lateral_conv_p{}".format(i))
-      upsampled = self.nn_upsample(fpn_features["P{}".format(i + 1)], 
-                                    lateral.shape[1:])
+      lateral = conv(
+          backbone_features["C{}".format(i)],
+          kernel_size=(1, 1),
+          name="lateral_conv_p{}".format(i))
+      upsampled = self.nn_upsample(fpn_features["P{}".format(i + 1)],
+                                   lateral.shape[1:])
       fpn_features["P{}".format(i)] = conv(
-        upsampled + lateral, kernel_size=(3, 3),
-        name="antialiasing_conv_p{}".format(i))
+          upsampled + lateral,
+          kernel_size=(3, 3),
+          name="antialiasing_conv_p{}".format(i))
 
     return fpn_features
 
-  def apply(self, data, depth=50, base_features=64, fpn_filters=256, anchors=9,
-            anchor_values=4, classes=1000, train=True, anchors_config=None, 
+  def apply(self,
+            data,
+            depth=50,
+            base_features=64,
+            fpn_filters=256,
+            anchors=9,
+            anchor_values=4,
+            classes=1000,
+            train=True,
+            anchors_config=None,
             dtype=jnp.float32):
     """Applies the RetinaNet architecture.
 
@@ -311,13 +349,13 @@ class RetinaNet(flax.nn.Module):
     fpn_features = self._top_down_phase(backbone_features, fpn_filters, dtype)
 
     # Create the partial shared models of the subnetworks
-    classification_subnet = ClassificationSubnet.shared(classes=classes,
-                                                        features=fpn_filters,
-                                                        anchors=anchors,
-                                                        dtype=dtype)
-    regression_subnet = RegressionSubnet.shared(anchor_values=anchor_values,
-                                                features=fpn_filters,
-                                                anchors=anchors, dtype=dtype)
+    classification_subnet = ClassificationSubnet.shared(
+        classes=classes, features=fpn_filters, anchors=anchors, dtype=dtype)
+    regression_subnet = RegressionSubnet.shared(
+        anchor_values=anchor_values,
+        features=fpn_filters,
+        anchors=anchors,
+        dtype=dtype)
 
     # Obtain regresssions and classifications from P3 to P7
     bboxes = jnp.zeros((data.shape[0], 0, 4), dtype=dtype)
@@ -328,24 +366,23 @@ class RetinaNet(flax.nn.Module):
       # Get the feature maps for this subnet
       layer_input = fpn_features["P{}".format(layer_idx)]
 
-      # Compute the regressions and the classifications, then append them 
+      # Compute the regressions and the classifications, then append them
       regressions_temp = regression_subnet(layer_input)
-      classifications_temp = classification_subnet(layer_input) 
+      classifications_temp = classification_subnet(layer_input)
 
       regressions = jnp.append(regressions, regressions_temp, axis=1)
-      classifications = jnp.append(classifications, classifications_temp, 
-                                   axis=1)
+      classifications = jnp.append(
+          classifications, classifications_temp, axis=1)
 
       # If not training, then expand the anchors and apply regressions
       if not train:
-        anchors = generate_anchors(layer_input.shape[:3], 
+        anchors = generate_anchors(layer_input.shape[:3],
                                    anchors_config.strides[idx],
                                    anchors_config.sizes[idx],
-                                   anchors_config.ratios,
-                                   anchors_config.scales,
+                                   anchors_config.ratios, anchors_config.scales,
                                    dtype)
-        bboxes_temp = apply_anchor_regressions(anchors, regressions_temp, 
-                                               dtype=dtype)
+        bboxes_temp = apply_anchor_regressions(
+            anchors, regressions_temp, dtype=dtype)
         bboxes = jnp.append(bboxes, bboxes_temp, axis=1)
 
     # Return the regressions, classifications, and bboxes
