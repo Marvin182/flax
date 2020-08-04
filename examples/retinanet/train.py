@@ -12,8 +12,11 @@ import input_pipeline
 from model import create_retinanet
 
 
-def create_scheduled_decay_fn(learning_rate: float, *, num_train_steps: int,
-                              warmup_steps: int, division_factor: float = 10.0,
+def create_scheduled_decay_fn(learning_rate: float,
+                              *,
+                              num_train_steps: int,
+                              warmup_steps: int,
+                              division_factor: float = 10.0,
                               division_schedule: list = None):
   """Creates a scheduled division based learning rate decay function.
 
@@ -50,7 +53,7 @@ def create_scheduled_decay_fn(learning_rate: float, *, num_train_steps: int,
 
   # Define the decay function
   def decay_fn(step):
-    lr = lr / division_factor ** jnp.argmax(division_schedule > step)
+    lr = lr / division_factor**jnp.argmax(division_schedule > step)
 
     # Linearly increase the learning rate during warmup
     return lr * jnp.minimum(1., epoch / warmup_epochs)
@@ -127,10 +130,7 @@ def compute_metrics(pred, labels):
   """
   cross_entropy = jnp.mean(cross_entropy_loss(pred, labels))
   accuracy = jnp.mean(jnp.argmax(pred, axis=1) == labels)
-  metrics = {
-    "accuracy": accuracy,
-    "cross_entropy": cross_entropy
-  }
+  metrics = {"accuracy": accuracy, "cross_entropy": cross_entropy}
   return jax.lax.pmean(metrics, "device")
 
 
@@ -151,6 +151,7 @@ def eval_step(data, meta_state):
     pred = meta_state.optimizer.target(data['image'], train=False)
   return compute_metrics(pred, data['label'])
 
+
 def aggregate_evals(eval_array):
   vals = jnp.array(list(map(lambda x: list(x.values()), eval_array)))
   return dict(zip(eval_array[0].keys(), jnp.mean(vals, axis=0)))
@@ -161,14 +162,15 @@ class CheckpointState:
   """A dataclass which stores the state of the training loop.
   """
   # The state variable of the model
-  model_state : flax.nn.Collection
+  model_state: flax.nn.Collection
   # The optimizer, which also holds the model
-  optimizer : flax.optim.Optimizer
+  optimizer: flax.optim.Optimizer
   # The global state of this checkpoint
-  step : int = -1
+  step: int = -1
 
 
-def checkpoint_state(meta_state : CheckpointState, checkpoint_step : int,
+def checkpoint_state(meta_state: CheckpointState,
+                     checkpoint_step: int,
                      checkpoint_dir="checkpoints"):
   """
   Checkpoints the training state.
@@ -227,6 +229,7 @@ def create_step_fn(lr_function):
     in two arguments: the batch, and a `CheckpointState` object, which
     stores the current training state.
   """
+
   def take_step(data, meta_state: CheckpointState):
     """Trains the model on a batch and returns the updated model.
 
@@ -237,6 +240,7 @@ def create_step_fn(lr_function):
     Returns:
       The updated model as a `CheckpointState` object and the batch's loss
     """
+
     def _loss_fn(model, state):
       with flax.nn.stateful(state) as new_state:
         pred = model(data['image'])
@@ -245,8 +249,8 @@ def create_step_fn(lr_function):
       # Penalize large model weights via a decayed l2 norm
       weight_decay = 0.0001 * 0.5
       weights = jax.tree_leaves(model.params)
-      weight_loss = weight_decay * sum([jnp.sum(x ** 2)
-                                        for x in weights if x.ndim > 1])
+      weight_loss = weight_decay * sum(
+          [jnp.sum(x**2) for x in weights if x.ndim > 1])
 
       return loss + weight_loss, (new_state, pred)
 
@@ -254,8 +258,9 @@ def create_step_fn(lr_function):
     step = meta_state.step + 1
 
     # Compute the gradients
-    aux, grads = jax.value_and_grad(_loss_fn, has_aux=True)(
-      meta_state.optimizer.target, meta_state.model_state)
+    aux, grads = jax.value_and_grad(
+        _loss_fn, has_aux=True)(meta_state.optimizer.target,
+                                meta_state.model_state)
     new_model_state, pred = aux[1]
     metrics = compute_metrics(pred, data['label'])
 
@@ -264,11 +269,11 @@ def create_step_fn(lr_function):
 
     # Apply the gradients to the model
     updated_optimizer = meta_state.optimizer.apply_gradient(
-      grads, learning_rate=lr_function(step))
+        grads, learning_rate=lr_function(step))
 
     # Update the meta_state
-    meta_state = meta_state.replace(step=step, model_state=new_model_state,
-                                    optimizer=updated_optimizer)
+    meta_state = meta_state.replace(
+        step=step, model_state=new_model_state, optimizer=updated_optimizer)
 
     return meta_state, metrics
 
@@ -290,14 +295,15 @@ def train_and_evaluate(config, workdir: str):
 
   if config.batch_size % jax.device_count():
     raise ValueError(f"Batch_size ({config.batch_size}) must be divisible by "
-        f"the number of devices {jax.device_count}).")
+                     f"the number of devices {jax.device_count}).")
 
   # Set up the data pipeline
   dataset_builder = tfds.builder("coco/2014")
   num_classes = dataset_builder.info.features["objects"]["label"].num_classes
   rng, data_rng = jax.random.split(rng)
   data = input_pipeline.read_data(data_rng)
-  train_data, val_data = input_pipeline.prepare_data(data, per_device_batch_size=config.batch_size // jax.device_count())
+  train_data, val_data = input_pipeline.prepare_data(
+      data, per_device_batch_size=config.batch_size // jax.device_count())
   logging.info("Training data shapes: %s", train_data.element_spec)
   input_shape = list(train_data.element_spec["image"].shape)[1:]
   train_iter = iter(train_data)
@@ -308,10 +314,11 @@ def train_and_evaluate(config, workdir: str):
 
   # Create the training entities, and replicate the state
   rng, model_rng = jax.random.split(rng)
-  model, model_state = create_model(model_rng, shape=input_shape,
-    classes=num_classes, depth=config.depth)
-  optimizer = create_optimizer(model,  beta=0.9, weight_decay=0.0001)
-  meta_state = CheckpointState(optimizer=optimizer, model_state=model_state, step=0)
+  model, model_state = create_model(
+      model_rng, shape=input_shape, classes=num_classes, depth=config.depth)
+  optimizer = create_optimizer(model, beta=0.9, weight_decay=0.0001)
+  meta_state = CheckpointState(
+      optimizer=optimizer, model_state=model_state, step=0)
   del model, model_state, optimizer  # Remove duplicate data
 
   # Try to restore the state of a previous run
@@ -325,7 +332,9 @@ def train_and_evaluate(config, workdir: str):
   # Prepare the LR scheduler
   learning_rate = config.learning_rate * config.batch_size / 256
   learning_rate_fn = create_scheduled_decay_fn(
-      learning_rate, num_train_steps=config.num_train_steps, warmup_steps=config.warmup_steps)
+      learning_rate,
+      num_train_steps=config.num_train_steps,
+      warmup_steps=config.warmup_steps)
 
   # Prepare the training loop for distributed runs
   step_fn = create_step_fn(learning_rate_fn)
