@@ -2,7 +2,7 @@ from flax.training import checkpoints
 from input_pipeline import prepare_data
 from jax import numpy as jnp
 from model import create_retinanet
-from typing import Any, Dict, Iterable, Mapping, Tuple 
+from typing import Any, Dict, Iterable, Mapping, Tuple
 
 import flax
 import jax
@@ -14,15 +14,17 @@ class State:
   """A dataclass which stores the state of the training loop.
   """
   # The state variable of the model
-  model_state : flax.nn.Collection
+  model_state: flax.nn.Collection
   # The optimizer, which also holds the model
-  optimizer : flax.optim.Optimizer
+  optimizer: flax.optim.Optimizer
   # The global state of this checkpoint
-  step : int = 0
+  step: int = 0
 
 
-def create_scheduled_decay_fn(learning_rate: float, training_steps: int, 
-                              warmup_steps: int, division_factor:float = 10.0,
+def create_scheduled_decay_fn(learning_rate: float,
+                              training_steps: int,
+                              warmup_steps: int,
+                              division_factor: float = 10.0,
                               division_schedule: list = None):
   """Creates a scheduled division based learning rate decay function.
 
@@ -56,10 +58,10 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
 
   # Adjust the schedule to not consider the warmup steps
   division_schedule = jnp.sort(jnp.unique(division_schedule)) + warmup_steps
-  
+
   # Define the decay function
   def decay_fn(step: int) -> float:
-    lr = learning_rate / division_factor ** jnp.argmax(division_schedule > step)
+    lr = learning_rate / division_factor**jnp.argmax(division_schedule > step)
 
     # Linearly increase the learning rate during warmup
     return lr * jnp.minimum(1., step / warmup_steps)
@@ -67,8 +69,10 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
   return decay_fn
 
 
-def create_model(rng: jnp.ndarray, depth: int = 50, classes: int = 1000, 
-                 shape: Iterable[int] = (224, 224, 3), 
+def create_model(rng: jnp.ndarray,
+                 depth: int = 50,
+                 classes: int = 1000,
+                 shape: Iterable[int] = (224, 224, 3),
                  dtype: jnp.dtype = jnp.float32) -> flax.nn.Model:
   """Creates a RetinaNet model.
 
@@ -92,7 +96,8 @@ def create_model(rng: jnp.ndarray, depth: int = 50, classes: int = 1000,
   return flax.nn.Model(partial_module, params), init_state
 
 
-def create_optimizer(model: flax.nn.Model, optimizer: str = "momentum", 
+def create_optimizer(model: flax.nn.Model,
+                     optimizer: str = "momentum",
                      **optimizer_params) -> flax.optim.Optimizer:
   """Create either an Adam or Momentum optimizer.
 
@@ -115,8 +120,11 @@ def create_optimizer(model: flax.nn.Model, optimizer: str = "momentum",
 
 
 @jax.vmap
-def focal_loss(logits: jnp.array, label: int, anchor_type: int, 
-               alpha: float = 0.25, gamma: float = 2.0) -> float:
+def focal_loss(logits: jnp.array,
+               label: int,
+               anchor_type: int,
+               alpha: float = 0.25,
+               gamma: float = 2.0) -> float:
   """Implements the Focal Loss.
 
   Args:
@@ -131,13 +139,13 @@ def focal_loss(logits: jnp.array, label: int, anchor_type: int,
     The value of the Focal Loss for this anchor.
   """
   # Only consider foreground (1) and background (0) anchors for this loss
-  c = jnp.minimum(anchor_type + 1, 1)  
-  return c * -alpha * ((1 - logits[label]) ** gamma) * jnp.log(logits[label])
+  c = jnp.minimum(anchor_type + 1, 1)
+  return c * -alpha * ((1 - logits[label])**gamma) * jnp.log(logits[label])
 
 
 @jax.vmap
-def smooth_l1(regressions: jnp.array, targets: jnp.array, 
-               anchor_type: int) -> float:
+def smooth_l1(regressions: jnp.array, targets: jnp.array,
+              anchor_type: int) -> float:
   """Implements the Smooth-L1 loss. 
 
   Args:
@@ -151,15 +159,19 @@ def smooth_l1(regressions: jnp.array, targets: jnp.array,
   # Only consider foreground (1) anchors for this loss
   c = jnp.maximum(anchor_type, 0)
   deltas = regressions - targets
-  return c * jnp.sum(jnp.where(jnp.absolute(deltas) < 1.0, 
-    0.5 * deltas ** 2.0, jnp.absolute(deltas) - 0.5))
+  return c * jnp.sum(
+      jnp.where(
+          jnp.absolute(deltas) < 1.0, 0.5 * deltas**2.0,
+          jnp.absolute(deltas) - 0.5))
 
 
 @jax.vmap
-def retinanet_loss(classifications: jnp.array, regressions: jnp.array, 
-                    anchor_types: jnp.array, classification_targets: jnp.array, 
-                    regression_targets: jnp.array, 
-                    reg_weight: float = 1.0) -> float:
+def retinanet_loss(classifications: jnp.array,
+                   regressions: jnp.array,
+                   anchor_types: jnp.array,
+                   classification_targets: jnp.array,
+                   regression_targets: jnp.array,
+                   reg_weight: float = 1.0) -> float:
   """Implements the loss for the RetinaNet: Focal Loss and Smooth-L1
 
   Args:
@@ -182,11 +194,11 @@ def retinanet_loss(classifications: jnp.array, regressions: jnp.array,
   valid_anchors = jnp.sum(anchor_types >= 0)
   fl = focal_loss(classifications, classification_targets, anchor_types)
   sl1 = smooth_l1(regressions, regression_targets, anchor_types)
-  return jnp.sum(fl + sl1 * reg_weight) / valid_anchors  
+  return jnp.sum(fl + sl1 * reg_weight) / valid_anchors
 
 
-def compute_metrics(classifications: jnp.array, regressions: jnp.array, 
-                    bboxes: jnp.array, 
+def compute_metrics(classifications: jnp.array, regressions: jnp.array,
+                    bboxes: jnp.array,
                     data: Mapping[str, jnp.array]) -> Dict[str, float]:
   """Returns the accuracy and the cross entropy.
 
@@ -202,9 +214,10 @@ def compute_metrics(classifications: jnp.array, regressions: jnp.array,
     A dictionary containins the metrics
   """
   metrics = {
-    "retinanet_loss": retinanet_loss(
-      classifications, regressions, data['anchor_type'], 
-      data['classification_labels'], data['regression_targets'])
+      "retinanet_loss":
+          retinanet_loss(classifications, regressions, data['anchor_type'],
+                         data['classification_labels'],
+                         data['regression_targets'])
   }
   return metrics
 
@@ -224,7 +237,7 @@ def eval(data: jnp.array, meta_state: State) -> Dict[str, float]:
   """
   with flax.nn.stateful(meta_state.model_state, mutable=False):
     regressions, classifications, bboxes = meta_state.optimizer.target(
-      data['image'], train=False)
+        data['image'], train=False)
   return compute_metrics(regressions, classifications, bboxes, data)
 
 
@@ -238,10 +251,11 @@ def aggregate_evals(eval_array):
   for k in accumulator:
     accumulator[k] /= count
 
-  return accumulator 
+  return accumulator
 
 
-def checkpoint_state(meta_state: State, checkpoint_step: int,
+def checkpoint_state(meta_state: State,
+                     checkpoint_step: int,
                      checkpoint_dir: str = "checkpoints") -> None:
   """Checkpoints the training state.
 
@@ -254,7 +268,7 @@ def checkpoint_state(meta_state: State, checkpoint_step: int,
   checkpoints.save_checkpoint(checkpoint_dir, meta_state, checkpoint_step)
 
 
-def restore_checkpoint(meta_state: State, 
+def restore_checkpoint(meta_state: State,
                        checkpoint_dir: str = "checkpoints") -> State:
   """Restores the latest checkpoint.
 
@@ -285,7 +299,8 @@ def create_step_fn(lr_function):
     in two arguments: the batch, and a `State` object, which
     stores the current training state.
   """
-  def take_step(data: Mapping[str, jnp.array], 
+
+  def take_step(data: Mapping[str, jnp.array],
                 meta_state: State) -> Tuple[State, Any]:
     """Trains the model on a batch and returns the updated model.
 
@@ -296,13 +311,14 @@ def create_step_fn(lr_function):
     Returns:
       The updated model as a `State` object and the batch's loss
     """
+
     def _loss_fn(model: flax.nn.Model, state: flax.nn.Collection):
       with flax.nn.stateful(state) as new_state:
         classifications, regressions, _ = model(data['image'])
-      loss = jnp.mean(retinanet_loss(classifications, regressions, 
-                                     data['anchor_type'], 
-                                     data['classification_labels'], 
-                                     data['regression_targets']))
+      loss = jnp.mean(
+          retinanet_loss(classifications, regressions, data['anchor_type'],
+                         data['classification_labels'],
+                         data['regression_targets']))
 
       return loss, new_state
 
@@ -310,29 +326,35 @@ def create_step_fn(lr_function):
     step = meta_state.step + 1
 
     # Compute the gradients
-    aux, grads = jax.value_and_grad(_loss_fn, has_aux=True)(
-      meta_state.optimizer.target, meta_state.model_state)
+    aux, grads = jax.value_and_grad(
+        _loss_fn, has_aux=True)(meta_state.optimizer.target,
+                                meta_state.model_state)
     loss, new_model_state = aux
 
     # Apply the gradients to the model
     updated_optimizer = meta_state.optimizer.apply_gradient(
-      grads, learning_rate=lr_function(step))
+        grads, learning_rate=lr_function(step))
 
     # Update the meta_state
-    meta_state = meta_state.replace(step=step, model_state=new_model_state,
-                                    optimizer=updated_optimizer)
+    meta_state = meta_state.replace(
+        step=step, model_state=new_model_state, optimizer=updated_optimizer)
 
     return meta_state, {"retinanet_loss": loss}
 
   return take_step
 
 
-def train_retinanet_model(rng: jnp.array, train_data: jnp.array, 
-                          test_data: jnp.array, shape: list, classes: int = 80, 
-                          depth: int = 50, learning_rate: float = 0.1, 
-                          batch_size: int = 64, training_steps: int = 90000,
-                          warmup_steps: int = 30000, 
-                          try_restore: bool = True, 
+def train_retinanet_model(rng: jnp.array,
+                          train_data: jnp.array,
+                          test_data: jnp.array,
+                          shape: list,
+                          classes: int = 80,
+                          depth: int = 50,
+                          learning_rate: float = 0.1,
+                          batch_size: int = 64,
+                          training_steps: int = 90000,
+                          warmup_steps: int = 30000,
+                          try_restore: bool = True,
                           half_precision: bool = False,
                           checkpoint_period: int = 20000) -> State:
   """This method trains a RetinaNet instance.
@@ -364,9 +386,9 @@ def train_retinanet_model(rng: jnp.array, train_data: jnp.array,
 
   # Create the training entities, and replicate the state
   rng, rng_input = jax.random.split(rng)
-  model, model_state = create_model(rng_input, shape=shape, classes=classes, 
-                                    depth=depth, dtype=dtype)
-  optimizer = create_optimizer(model,  beta=0.9, weight_decay=0.0001)
+  model, model_state = create_model(
+      rng_input, shape=shape, classes=classes, depth=depth, dtype=dtype)
+  optimizer = create_optimizer(model, beta=0.9, weight_decay=0.0001)
   meta_state = State(optimizer=optimizer, model_state=model_state)
   del model, model_state, optimizer  # Remove duplicate data
 
@@ -376,7 +398,7 @@ def train_retinanet_model(rng: jnp.array, train_data: jnp.array,
 
   # Prepare the LR scheduler
   learning_rate *= batch_size / 256
-  learning_rate_fn = create_scheduled_decay_fn(learning_rate, training_steps, 
+  learning_rate_fn = create_scheduled_decay_fn(learning_rate, training_steps,
                                                warmup_steps)
 
   # Create the step function
@@ -393,7 +415,7 @@ def train_retinanet_model(rng: jnp.array, train_data: jnp.array,
     if step % checkpoint_period == 0 and step != 0:
       epoch = step // checkpoint_period
       # checkpoint_state(meta_state, epoch)
-      
+
       eval_results = []
       test_iter = iter(test_data)
       for _ in range(100):

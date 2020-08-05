@@ -6,7 +6,6 @@ from configs.default import get_config
 import jax
 import tensorflow as tf
 
-
 WORK_DIR = "./distributed_retinanet"
 
 
@@ -26,12 +25,13 @@ def main(single_thread: bool = True):
 
   if single_thread:
     import train_single_thread as logic
-    logic.train_retinanet_model(rng,
-                                train_data,
-                                test_data,
-                                img_size,
-                                batch_size=batch_size,
-                                try_restore=False)
+    logic.train_retinanet_model(
+        rng,
+        train_data,
+        test_data,
+        img_size,
+        batch_size=batch_size,
+        try_restore=False)
   else:
     import train as logic
     config = get_config()
