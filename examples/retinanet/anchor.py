@@ -13,12 +13,12 @@ class AnchorConfig:
   to the number of layers in RetinaNet's head. `scales` and `ratios` are lists
   of arbitrary lengths.
   """
-  levels : list = field(default_factory=lambda: [3, 4, 5, 6, 7])
-  sizes : list = field(default_factory=lambda: [32, 64, 128, 256, 512])
-  strides : list = field(default_factory=lambda: [8, 16, 32, 64, 128])
-  ratios : list = field(default_factory=lambda: [0.5, 1, 2])
-  scales : list = field(default_factory=lambda: [1.0, 2.0 ** (1.0 / 3.0),
-                                                 2.0 ** (2.0 / 3.0)])
+  levels: list = field(default_factory=lambda: [3, 4, 5, 6, 7])
+  sizes: list = field(default_factory=lambda: [32, 64, 128, 256, 512])
+  strides: list = field(default_factory=lambda: [8, 16, 32, 64, 128])
+  ratios: list = field(default_factory=lambda: [0.5, 1, 2])
+  scales: list = field(
+      default_factory=lambda: [1.0, 2.0**(1.0 / 3.0), 2.0**(2.0 / 3.0)])
 
 
 def generate_base_anchors(size, ratios, scales, dtype=jnp.float32):
@@ -99,19 +99,29 @@ def clip_anchors(anchors, shape):
   Returns:
     A matrix of the form (|A|, 4), which contains the clipped anchors
   """
-  anchors = jax.ops.index_update(anchors, jax.ops.index[:, 0], 
-    jnp.minimum(jnp.maximum(anchors[:, 0], 0), shape[1]))
-  anchors = jax.ops.index_update(anchors, jax.ops.index[:, 1], 
-    jnp.minimum(jnp.maximum(anchors[:, 1], 0), shape[0]))
-  anchors = jax.ops.index_update(anchors, jax.ops.index[:, 2], 
-    jnp.minimum(jnp.maximum(anchors[:, 2], 0), shape[1]))
-  anchors = jax.ops.index_update(anchors, jax.ops.index[:, 3], 
-    jnp.minimum(jnp.maximum(anchors[:, 3], 0), shape[0]))
+  anchors = jax.ops.index_update(
+      anchors, jax.ops.index[:, 0],
+      jnp.minimum(jnp.maximum(anchors[:, 0], 0), shape[1]))
+  anchors = jax.ops.index_update(
+      anchors, jax.ops.index[:, 1],
+      jnp.minimum(jnp.maximum(anchors[:, 1], 0), shape[0]))
+  anchors = jax.ops.index_update(
+      anchors, jax.ops.index[:, 2],
+      jnp.minimum(jnp.maximum(anchors[:, 2], 0), shape[1]))
+  anchors = jax.ops.index_update(
+      anchors, jax.ops.index[:, 3],
+      jnp.minimum(jnp.maximum(anchors[:, 3], 0), shape[0]))
   return anchors
 
 
-def generate_all_anchors(shape, levels, strides, sizes, ratios, scales, 
-                         clip=False, dtype=jnp.float32):
+def generate_all_anchors(shape,
+                         levels,
+                         strides,
+                         sizes,
+                         ratios,
+                         scales,
+                         clip=False,
+                         dtype=jnp.float32):
   """Generate all the anchors for an image of a given size.
 
   More specifically, given an image size, this method generates the entire 
@@ -137,17 +147,17 @@ def generate_all_anchors(shape, levels, strides, sizes, ratios, scales,
   assert len(levels) == len(strides) == len(sizes), "levels, strides and sizes"\
                                                     "must have the same length"
 
-  # Compute the feature map sizes 
+  # Compute the feature map sizes
   shape = jnp.array(shape)
-  feature_maps = [(shape + 2 ** level - 1) // (2 ** level) for level in levels]
+  feature_maps = [(shape + 2**level - 1) // (2**level) for level in levels]
 
-  # Stack the anchors on axis 0: first levels[0], ..., levels[-1] 
+  # Stack the anchors on axis 0: first levels[0], ..., levels[-1]
   anchors = jnp.zeros((1, 0, 4), dtype=dtype)
   for idx, feature_map in enumerate(feature_maps):
-    res = generate_anchors((1,) + tuple(feature_map), strides[idx], 
-                           sizes[idx], ratios, scales, dtype)
+    res = generate_anchors((1,) + tuple(feature_map), strides[idx], sizes[idx],
+                           ratios, scales, dtype)
     anchors = jnp.append(anchors, res, axis=1)
-  
+
   anchors = anchors[0, :, :]
 
   # Clip the anchors such that their coords do not fall outside the image bounds
@@ -158,7 +168,10 @@ def generate_all_anchors(shape, levels, strides, sizes, ratios, scales,
   return jnp.concatenate((anchors, extra_zeros), axis=1)
 
 
-def apply_anchor_regressions(anchors, regressions, means=None, devs=None, 
+def apply_anchor_regressions(anchors,
+                             regressions,
+                             means=None,
+                             devs=None,
                              dtype=jnp.float32):
   """Applies the regression values to the raw anchor boxes.
 

@@ -13,21 +13,22 @@ import input_pipeline
 from model import create_retinanet
 
 
-
 @flax.struct.dataclass
 class State:
   """A dataclass which stores the state of the training loop.
   """
   # The state variable of the model
-  model_state : flax.nn.Collection
+  model_state: flax.nn.Collection
   # The optimizer, which also holds the model
-  optimizer : flax.optim.Optimizer
+  optimizer: flax.optim.Optimizer
   # The global state of this checkpoint
-  step : int = 0
+  step: int = 0
 
 
-def create_scheduled_decay_fn(learning_rate: float, training_steps: int, 
-                              warmup_steps: int, division_factor:float = 10.0,
+def create_scheduled_decay_fn(learning_rate: float,
+                              training_steps: int,
+                              warmup_steps: int,
+                              division_factor: float = 10.0,
                               division_schedule: list = None):
   """Creates a scheduled division based learning rate decay function.
 
@@ -61,10 +62,10 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
 
   # Adjust the schedule to not consider the warmup steps
   division_schedule = jnp.sort(jnp.unique(division_schedule)) + warmup_steps
-  
+
   # Define the decay function
   def decay_fn(step: int) -> float:
-    lr = learning_rate / division_factor ** jnp.argmax(division_schedule > step)
+    lr = learning_rate / division_factor**jnp.argmax(division_schedule > step)
 
     # Linearly increase the learning rate during warmup
     return lr * jnp.minimum(1., step / warmup_steps)
@@ -72,8 +73,10 @@ def create_scheduled_decay_fn(learning_rate: float, training_steps: int,
   return decay_fn
 
 
-def create_model(rng: jnp.ndarray, depth: int = 50, classes: int = 1000, 
-                 shape: Iterable[int] = (224, 224, 3), 
+def create_model(rng: jnp.ndarray,
+                 depth: int = 50,
+                 classes: int = 1000,
+                 shape: Iterable[int] = (224, 224, 3),
                  dtype: jnp.dtype = jnp.float32) -> flax.nn.Model:
   """Creates a RetinaNet model.
 
@@ -93,7 +96,8 @@ def create_model(rng: jnp.ndarray, depth: int = 50, classes: int = 1000,
   # Since the BatchNorm has state, we'll need to use stateful here
   with flax.nn.stateful() as init_state:
     # _, params = partial_module.init(rng, jnp.zeros(shape))
-    _, params = partial_module.init_by_shape(rng, input_specs=[(shape, jnp.float32)]) 
+    _, params = partial_module.init_by_shape(
+        rng, input_specs=[(shape, jnp.float32)])
 
   return flax.nn.Model(partial_module, params), init_state
 
@@ -145,10 +149,7 @@ def compute_metrics(pred, labels):
   """
   cross_entropy = jnp.mean(cross_entropy_loss(pred, labels))
   accuracy = jnp.mean(jnp.argmax(pred, axis=1) == labels)
-  metrics = {
-    "accuracy": accuracy,
-    "cross_entropy": cross_entropy
-  }
+  metrics = {"accuracy": accuracy, "cross_entropy": cross_entropy}
   return jax.lax.pmean(metrics, "batch")
 
 
@@ -175,7 +176,8 @@ def aggregate_evals(eval_array):
   return dict(zip(eval_array[0].keys(), jnp.mean(vals, axis=0)))
 
 
-def checkpoint_state(meta_state : State, checkpoint_step : int,
+def checkpoint_state(meta_state: State,
+                     checkpoint_step: int,
                      checkpoint_dir="checkpoints"):
   """
   Checkpoints the training state.
@@ -303,22 +305,28 @@ def train_and_evaluate(config, workdir: str):
   rng, data_rng = jax.random.split(rng)
   data = input_pipeline.read_data(data_rng)
   train_data, val_data = input_pipeline.prepare_data(
-    data, per_device_batch_size=config.per_device_batch_size, 
-    distributed_training=config.distributed_training, 
-    shape=[config.img_min_side, config.img_max_side])
+      data,
+      per_device_batch_size=config.per_device_batch_size,
+      distributed_training=config.distributed_training,
+      shape=[config.img_min_side, config.img_max_side])
 
   logging.info("Training data shapes: %s", train_data.element_spec)
   input_shape = list(train_data.element_spec["image"].shape)[1:]
 
   # Create the training entities, and replicate the state
   rng, model_rng = jax.random.split(rng)
-  model, model_state = create_model(model_rng, shape=input_shape,
-    classes=num_classes, depth=config.depth, dtype=config.dtype)
-  optimizer = create_optimizer(model,  beta=0.9, weight_decay=0.0001)
+
+  model, model_state = create_model(
+      model_rng,
+      shape=input_shape,
+      classes=num_classes,
+      depth=config.depth,
+      dtype=config.dtype)
+  optimizer = create_optimizer(model, beta=0.9, weight_decay=0.0001)
   meta_state = State(optimizer=optimizer, model_state=model_state)
   del model, model_state, optimizer
 
-   # Try to restore the state of a previous run 
+  # Try to restore the state of a previous run
   if config.try_restore:
     meta_state = restore_checkpoint(meta_state)
   start_step = meta_state.step
@@ -328,15 +336,16 @@ def train_and_evaluate(config, workdir: str):
 
   # Prepare the LR scheduler
   learning_rate = config.learning_rate * config.per_device_batch_size / 256
-  learning_rate_fn = create_scheduled_decay_fn(
-      learning_rate, config.num_train_steps, config.warmup_steps)
+  learning_rate_fn = create_scheduled_decay_fn(learning_rate,
+                                               config.num_train_steps,
+                                               config.warmup_steps)
 
   # Prepare the training loop for distributed runs
   step_fn = create_step_fn(learning_rate_fn)
   p_step_fn = jax.pmap(step_fn, axis_name="batch")
   p_eval_fn = jax.pmap(eval_step, axis_name="batch")
 
-  return 
+  return
 
   # Run the training loop
   train_iter = iter(train_data)
