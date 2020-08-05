@@ -223,10 +223,7 @@ def compute_metrics(classifications: jnp.array, regressions: jnp.array,
 
 
 def eval(data: jnp.array, meta_state: State) -> Dict[str, float]:
-  """Evaluates the model.
-
-  The evaluation is done against the Log-loss and the Accuracy
-  metrics. Note, the model should be stateful.
+  """Evaluates the model using the RetinaNet loss.
 
   Args:
     data: the test data

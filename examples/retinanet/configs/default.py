@@ -1,5 +1,6 @@
 from jax.numpy import float32
 
+
 class ConfigDict(dict):
   """Dictionary with dot access to values."""
 
@@ -21,7 +22,7 @@ class ConfigDict(dict):
     del self.__dict__[key]
 
 
-def get_config():
+def get_default_config():
   """Get the default hyperparameter configuration."""
   config = ConfigDict()
 
@@ -41,7 +42,8 @@ def get_config():
   # The number of layers in the RetinaNet backbone.
   config.depth = 50
 
-  config.checkpoint_every_steps = 20_000
+  config.sync_steps = 1_000
+  config.checkpoint_period = 20_000
 
   config.seed = 42
 
