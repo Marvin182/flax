@@ -1,13 +1,16 @@
 import math
 
 from absl import logging
+from configs.default import ConfigDict
 import flax
-from flax.training import checkpoints
+from flax.metrics import tensorboard
+from flax.training import checkpoints, common_utils
 import jax
 import jax.numpy as jnp
 import tensorflow as tf
 import tensorflow_datasets as tfds
-from typing import Iterable
+import sys
+from typing import Any, Iterable, Mapping, Tuple
 
 import input_pipeline
 from model import create_retinanet
@@ -95,15 +98,16 @@ def create_model(rng: jnp.ndarray,
 
   # Since the BatchNorm has state, we'll need to use stateful here
   with flax.nn.stateful() as init_state:
-    # _, params = partial_module.init(rng, jnp.zeros(shape))
     _, params = partial_module.init_by_shape(
         rng, input_specs=[(shape, jnp.float32)])
 
   return flax.nn.Model(partial_module, params), init_state
 
 
-def create_optimizer(model, optimizer="momentum", **optimizer_params):
-  """Create either a Momentum or an Adam optimizer.
+def create_optimizer(model: flax.nn.Model,
+                     optimizer: str = "momentum",
+                     **optimizer_params) -> flax.optim.Optimizer:
+  """Create either an Adam or Momentum optimizer.
 
   Args:
     model: a flax.nn.Model object, which encapsulates the neural network
@@ -124,17 +128,81 @@ def create_optimizer(model, optimizer="momentum", **optimizer_params):
 
 
 @jax.vmap
-def cross_entropy_loss(logits, label):
-  """Implements the Cross Entropy (Log-loss).
+def focal_loss(logits: jnp.array,
+               label: int,
+               anchor_type: int,
+               alpha: float = 0.25,
+               gamma: float = 2.0) -> float:
+  """Implements the Focal Loss.
 
   Args:
-    logits: the logit array
-    label: the ground truth
+    logits: an array of logits, with as many entries as candidate classes
+    label: the ground truth label
+    anchor_type: an integer which identifies the type of the anchor: 
+      ignored (-1), background (0), foreground (1). If -1, the loss will be 0
+    alpha: the value of the alpha constant in the Focal Loss
+    gamma: the value of the gamma constant in the Focal Loss
 
   Returns:
-    The Log-loss
+    The value of the Focal Loss for this anchor.
   """
-  return -jnp.log(logits[label])
+  # Only consider foreground (1) and background (0) anchors for this loss
+  c = jnp.minimum(anchor_type + 1, 1)
+  return c * -alpha * ((1 - logits[label])**gamma) * jnp.log(logits[label])
+
+
+@jax.vmap
+def smooth_l1(regressions: jnp.array, targets: jnp.array,
+              anchor_type: int) -> float:
+  """Implements the Smooth-L1 loss. 
+
+  Args:
+    regressions: an array of 4 elements containing the predicted regressions
+    targets: an array of 4 elements containing the target regressions
+    anchor_type: the type of the anchor whose predictions are being evaluated
+  
+  Returns:
+    The value of the Smooth-L1 loss for this anchor.
+  """
+  # Only consider foreground (1) anchors for this loss
+  c = jnp.maximum(anchor_type, 0)
+  deltas = regressions - targets
+  return c * jnp.sum(
+      jnp.where(
+          jnp.absolute(deltas) < 1.0, 0.5 * deltas**2.0,
+          jnp.absolute(deltas) - 0.5))
+
+
+@jax.vmap
+def retinanet_loss(classifications: jnp.array,
+                   regressions: jnp.array,
+                   anchor_types: jnp.array,
+                   classification_targets: jnp.array,
+                   regression_targets: jnp.array,
+                   reg_weight: float = 1.0) -> float:
+  """Implements the loss for the RetinaNet: Focal Loss and Smooth-L1
+
+  Args:
+    predictions: a matrix of size (|A|, K), where |A| is the number of anchors
+      and K is the number of classes, that cotains the model's predictions 
+    regressions: a matrix of size (|A|, 4) containing the predictions of 
+      the model for anchor location offsets
+    anchor_types: an array of size |A| indicating the type of each anchor: 
+      ignored (-1), background (0), foreground (1)
+    classification_targets: an array of |A| elements, containing the ground 
+      truth labels
+    regression_targets: a matrix of (|A|, 4) elements, containing the ground
+      truth regressions
+    reg_weight: a scalar, which indicates the weight of the Smooth-L1 
+      regularization term
+
+  Returns:
+    The image loss given by the RetinaNet loss function.
+  """
+  valid_anchors = jnp.sum(anchor_types >= 0)
+  fl = focal_loss(classifications, classification_targets, anchor_types)
+  sl1 = smooth_l1(regressions, regression_targets, anchor_types)
+  return jnp.sum(fl + sl1 * reg_weight) / valid_anchors
 
 
 def compute_metrics(pred, labels):
@@ -176,9 +244,7 @@ def aggregate_evals(eval_array):
   return dict(zip(eval_array[0].keys(), jnp.mean(vals, axis=0)))
 
 
-def checkpoint_state(meta_state: State,
-                     checkpoint_step: int,
-                     checkpoint_dir="checkpoints"):
+def checkpoint_state(meta_state: State, checkpoint_dir: str = "checkpoints"):
   """
   Checkpoints the training state.
 
@@ -190,10 +256,12 @@ def checkpoint_state(meta_state: State,
   """
   if jax.host_id() == 0:
     meta_state = jax.device_get(jax.tree_map(lambda x: x[0], meta_state))
-    checkpoints.save_checkpoint(checkpoint_dir, meta_state, checkpoint_step)
+    checkpoints.save_checkpoint(
+        checkpoint_dir, meta_state, meta_state.step, keep=3)
 
 
-def restore_checkpoint(meta_state, checkpoint_dir="checkpoints"):
+def restore_checkpoint(meta_state: State,
+                       checkpoint_dir: str = "checkpoints") -> State:
   """Restores the latest checkpoint.
 
   More specifically, either return the latest checkpoint from the
@@ -211,7 +279,7 @@ def restore_checkpoint(meta_state, checkpoint_dir="checkpoints"):
   return checkpoints.restore_checkpoint(checkpoint_dir, meta_state)
 
 
-def sync_model_state(meta_state):
+def sync_model_state(meta_state: State) -> State:
   """Synchronizes the model_state across devices.
 
   Args:
@@ -220,8 +288,8 @@ def sync_model_state(meta_state):
   Returns:
     A new State object with an updated `model_state` field.
   """
-  mean = jax.pmap(lambda x: jax.lax.pmean(x, 'axis'), 'axis')
-  return meta_state.replace(model_state=mean(meta_state.model_state))
+  sync_state = jax.pmap(lambda x: jax.lax.pmean(x, 'x'), 'x')
+  return meta_state.replace(model_state=sync_state(meta_state.model_state))
 
 
 def create_step_fn(lr_function):
@@ -236,7 +304,9 @@ def create_step_fn(lr_function):
     in two arguments: the batch, and a `State` object, which
     stores the current training state.
   """
-  def take_step(data, meta_state: State):
+
+  def take_step(data: Mapping[str, jnp.array],
+                meta_state: State) -> Tuple[State, Any]:
     """Trains the model on a batch and returns the updated model.
 
     Args:
@@ -247,31 +317,27 @@ def create_step_fn(lr_function):
       The updated model as a `State` object and the batch's loss
     """
 
-    def _loss_fn(model, state):
+    def _loss_fn(model: flax.nn.Model, state: flax.nn.Collection):
       with flax.nn.stateful(state) as new_state:
-        pred = model(data['image'])
-      loss = jnp.mean(cross_entropy_loss(pred, data['label']))
+        classifications, regressions, _ = model(data['image'])
+      loss = jnp.mean(
+          retinanet_loss(classifications, regressions, data['anchor_type'],
+                         data['classification_labels'],
+                         data['regression_targets']))
 
-      # Penalize large model weights via a decayed l2 norm
-      weight_decay = 0.0001 * 0.5
-      weights = jax.tree_leaves(model.params)
-      weight_loss = weight_decay * sum(
-          [jnp.sum(x**2) for x in weights if x.ndim > 1])
-
-      return loss + weight_loss, (new_state, pred)
+      return loss, new_state
 
     # flax.struct.dataclass is immutable, so unwrap it
     step = meta_state.step + 1
 
-    # Compute the gradients
+    # Compute the gradients and the loss, then average them across devices
     aux, grads = jax.value_and_grad(
         _loss_fn, has_aux=True)(meta_state.optimizer.target,
                                 meta_state.model_state)
-    new_model_state, pred = aux[1]
-    metrics = compute_metrics(pred, data['label'])
+    loss, new_model_state = aux
 
-    # Synchronize device model across devices
-    grads = jax.lax.pmean(grads, "batch")
+    grads = jax.lax.pmean(grads, axis_name='batch')
+    loss = jax.lax.pmean(loss, axis_name='batch')
 
     # Apply the gradients to the model
     updated_optimizer = meta_state.optimizer.apply_gradient(
@@ -281,20 +347,37 @@ def create_step_fn(lr_function):
     meta_state = meta_state.replace(
         step=step, model_state=new_model_state, optimizer=updated_optimizer)
 
-    return meta_state, metrics
+    return meta_state, {"retinanet_loss": loss}
 
   return take_step
 
 
-def train_and_evaluate(config, workdir: str):
+def eval_to_tensorboard(writer, evals, step):
+  evals = common_utils.get_metrics(evals)
+  summary = jax.tree_map(lambda x: x.mean(), evals)
+  logging.info("(Training Step #%d) Aggregated Metrics: %s", step, summary)
+
+  for key, vals in evals.items():
+    tag = 'train_%s' % key
+    for i, val in enumerate(vals):
+      writer.scalar(tag, val, step - len(vals) + i + 1)
+  writer.flush()
+
+
+def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
   """Runs a training and evaluation loop.
 
   Args:
-    config: Configuration to use.
+    config: a `ConfigDict` object, which holds all the information necessary
+      for configuring the training process
     workdir: Working directory for checkpoints and TF summaries. If this
       contains checkpoint, training will be resumed from the latest checkpoint.
   """
   tf.io.gfile.makedirs(workdir)
+  if jax.host_id() == 0:
+    summary_writer = tensorboard.SummaryWriter(workdir)
+  # FIXME: Remove this hacky way of logging
+  logging.get_absl_handler().python_handler.stream = sys.stdout
 
   # Deterministic training, see go/deterministic training.
   rng = jax.random.PRNGKey(config.seed)
@@ -345,40 +428,46 @@ def train_and_evaluate(config, workdir: str):
   p_step_fn = jax.pmap(step_fn, axis_name="batch")
   p_eval_fn = jax.pmap(eval_step, axis_name="batch")
 
-  return
-
   # Run the training loop
+  running_metrics = []
   train_iter = iter(train_data)
-  logging.info("Starting training loop at step %d.", initial_step)
-  for step in range(initial_step, config.num_train_steps + 1):
+  logging.info("Starting training loop at step %d.", start_step)
+  for step in range(start_step, config.num_train_steps + config.warmup_steps):
     batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
-    logging.info("Get input batch for step %d.", step)
+    logging.info("(Training Step #%d) Getting input batch.", step)
     meta_state, metrics = p_step_fn(batch, meta_state)
 
-    # Quick indication that training is happening.
-    logging.log_first_n(logging.INFO, "Finished training step %d.", 5, step)
+    # Log the loss for this batch
+    running_metrics.append(metrics)
+    metrics = jax.device_get(jax.tree_map(lambda x: x[0], metrics))
+    logging.info("(Training Step #%d) RetinaNet loss: %s.", step, metrics)
 
-    if step > 4:
-      return
+    # Periodically sync the model state
+    if step % config.sync_steps == 0 and step != 0:
+      meta_state = sync_model_state(meta_state)
 
-    print("Sipping eval and checkpointing. Let's get the loss go down first.")
+      # Submit the metrics to tensorboard
+      if jax.host_id() == 0:
+        eval_to_tensorboard(summary_writer, running_metrics, step)
+        running_metrics.clear()
     continue
 
-    # Sync up the model_state after every epoch
-    meta_state = sync_model_state(meta_state)
+    # Sync the model state, Evaluate and checkpoint the model
+    if step % config.checkpoint_period == 0 and step != 0:
+      # Checkpoint the model
+      meta_state = sync_model_state(meta_state)
+      checkpoint_state(meta_state)
 
-    # Evaluate the model
-    eval_results = []
-    val_iter = iter(val_data)
-    for _ in range(steps_per_eval):
-      # Use ._numpy() to avoid copy.
-      batch = jax.tree_map(lambda x: x._numpy(), next(val_iter))  # pylint: disable=protected-access
-      res = p_eval_fn(batch, meta_state)
-      eval_results.append(jax.tree_map(lambda x: x[0], res))
-    eval_results = aggregate_evals(eval_results)
-    print("(Epoch #{}) Evaluation results:\n".format(epoch), eval_results)
+      # Run evaluation on the model
+      eval_results = []
+      test_iter = iter(test_data)
+      for _ in range(100):
+        batch = jax.tree_map(lambda x: x._numpy(), next(test_iter))  # pylint: disable=protected-access
+        results = p_eval_fn(batch, meta_state)
+        eval_results.append(results)
+      eval_results = aggregate_evals(eval_results)
 
-    if epoch % checkpoint_period == 0:
-      checkpoint_state(meta_state, epoch)
+      checkpoint = step // config.checkpoint_period
+      logging.info("(Checkpoint #%d) RetinaNet loss: %s.", checkpoint, metrics)
 
   return meta_state
