@@ -68,7 +68,7 @@ def create_scheduled_decay_fn(learning_rate: float,
 
   # Define the decay function
   def decay_fn(step: int) -> float:
-    lr = learning_rate / division_factor**jnp.argmax(division_schedule > step)
+    lr = learning_rate / division_factor**jnp.sum(division_schedule < step)
 
     # Linearly increase the learning rate during warmup
     return lr * jnp.minimum(1., step / warmup_steps)
