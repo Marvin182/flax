@@ -26,7 +26,7 @@ def get_default_config():
   """Get the default hyperparameter configuration."""
   config = ConfigDict()
 
-  config.learning_rate = 0.1
+  config.learning_rate = 0.01
   config.per_device_batch_size = 2
   config.num_train_steps = 90_000
   config.warmup_steps = 30_000
