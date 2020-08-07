@@ -191,7 +191,7 @@ def retinanet_loss(classifications: jnp.array,
   Returns:
     The image loss given by the RetinaNet loss function.
   """
-  valid_anchors = jnp.sum(anchor_types >= 0)
+  valid_anchors = jnp.maximum(1, jnp.sum(anchor_types > 0))
   fl = focal_loss(classifications, classification_targets, anchor_types)
   sl1 = smooth_l1(regressions, regression_targets, anchor_types)
   return jnp.sum(fl + sl1 * reg_weight) / valid_anchors

@@ -42,7 +42,7 @@ def get_default_config():
   # The number of layers in the RetinaNet backbone.
   config.depth = 50
 
-  config.sync_steps = 1_000
+  config.sync_steps = 10
   config.checkpoint_period = 20_000
 
   config.seed = 42
