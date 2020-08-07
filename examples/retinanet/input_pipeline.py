@@ -432,7 +432,7 @@ class DataPreprocessor:
                                           (tf.shape(anchors)[0],))
 
     # Prepare the regression target computation
-    foreground_anchors = tf.gather(anchors, foreground_idx[:, 0])
+    foreground_anchors = tf.gather(in_anchors, foreground_idx[:, 0])
     argmax_foreground = tf.gather(argmax, foreground_idx[:, 0])
     foreground_bboxes = tf.gather(bboxes, argmax_foreground)
 
@@ -546,7 +546,10 @@ def is_annotated(data):
 
 
 def read_data(rng):
-  """Reads the `COCO/2014` dataset and creates a `trainval35k` subset for training and uses the rest of the validation data for testing.
+  """Prepares an instance of the COCO dataset for object detection training.
+
+  More specifically, reads the `COCO/2014` dataset and creates a `trainval35k` 
+  subset for training and uses the rest of the validation data for testing.
 
   Args:
      rng: JAX PRNGKey.
@@ -556,21 +559,10 @@ def read_data(rng):
 
     ```
     {
-      "shape": (1000, 1000, 3),
-      "train": {
-          "count": 117783,
-          "data": <train_data>
-      },
-      "test": {
-          "count": 5504,
-          "data": <test_data>
-      }
+      "train": train_data,
+      "test": test_data
     }
     ```
-
-    The literals `117783` and `5504` are the size of the training and testing
-    data respectively. As the COCO dataset size is constant, these can be
-    computed and hardcoded beforehand.
   """
   # Values according to https://www.tensorflow.org/datasets/catalog/coco
   VAL_SIZE = 5504
@@ -586,39 +578,25 @@ def read_data(rng):
       ],
       data_dir=getenv("TFDS_DATA_DIR"))
 
-  # TODO: Need to find a way to set image size easily, and also connect this
-  #       to the image preprocessing
-  data = {
-      "shape": (1000, 1000, 3),
-      "train": {
-          "count": 117783,  # 117783 = 82783 + 35000
-          "data": train_data
-      },
-      "test": {
-          "count": VAL_SIZE,
-          "data": test_data
-      }
-  }
-
+  data = {"train": train_data, "test": test_data}
   return data
 
 
 def prepare_data(
     data: tf.data.Dataset,
     per_device_batch_size: int,
-    distributed_training: bool = True,
+    distributed_training: bool = False,
     shape: Iterable[int] = None) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
   """Process a COCO dataset, and produce training and testing input pipelines.
 
   Args:
-    data: a dictionary of the form: ``` {
-        "shape": <shape>,
-        "train": {
-            "count": <train_example_count>,
-            "data": <train_data> },
-        "test": {
-            "count": <test_example_count>,
-            "data": <test_data> } } ```
+    data: a dictionary of the form: 
+    ``` 
+    {
+      "train": train_data,
+      "test": test_data
+    } 
+    ```
     per_device_batch_size: The batch size per device (GPU or TPU core). E.g.
       per_device_batch_size = global_batch_size // jax.device_count().
     distributed_training: True if the data is prepare for distributed training,
@@ -646,14 +624,14 @@ def prepare_data(
     batch_dims = [per_device_batch_size]
 
   # Prepare training data: standardize, resize and randomly flip the images
-  train = data["train"]["data"].filter(is_annotated).repeat().shuffle(
+  train = data["train"].filter(is_annotated).repeat().shuffle(
       device_count * per_device_batch_size * 16, seed=0).map(
           batch_preprocessor(augment_image=True), num_parallel_calls=autotune)
   for batch_size in reversed(batch_dims):
     train = train.batch(batch_size, drop_remainder=True)
 
   # Prepare the test data: only standardize and resize
-  test = data["test"]["data"].filter(is_annotated).map(
+  test = data["test"].filter(is_annotated).map(
       batch_preprocessor(), num_parallel_calls=autotune)
   for batch_size in reversed(batch_dims):
     test = test.batch(batch_size, drop_remainder=True)

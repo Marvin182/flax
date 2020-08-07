@@ -20,7 +20,7 @@ def run_model(single_device: bool = True):
     rng, input_key = jax.random.split(rng)
     data = read_data(input_key)
 
-    batch_size = 2
+    batch_size = 1
     img_size = (224, 224, 3)
     train_data, test_data = prepare_data(data, batch_size, not single_device,
                                          img_size[:2])
