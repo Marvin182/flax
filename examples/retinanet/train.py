@@ -15,6 +15,8 @@ from typing import Any, Iterable, Mapping, Tuple
 import input_pipeline
 from model import create_retinanet
 
+_EPSILON =  1e-7
+
 
 @flax.struct.dataclass
 class State:
@@ -148,7 +150,8 @@ def focal_loss(logits: jnp.array,
   """
   # Only consider foreground (1) and background (0) anchors for this loss
   c = jnp.minimum(anchor_type + 1, 1)
-  return c * -alpha * ((1 - logits[label])**gamma) * jnp.log(logits[label])
+  logit = jnp.clip(logits[label], _EPSILON, 1.0 - _EPSILON)
+  return c * -alpha * ((1 - logit)**gamma) * jnp.log(logit)
 
 
 @jax.vmap
