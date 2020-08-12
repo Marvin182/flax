@@ -8,7 +8,7 @@ import flax
 import jax
 import math
 
-_EPSILON =  1e-7
+_EPSILON =  1e-8
 
 
 @flax.struct.dataclass
@@ -142,7 +142,7 @@ def focal_loss(logits: jnp.array,
   """
   # Only consider foreground (1) and background (0) anchors for this loss
   c = jnp.minimum(anchor_type + 1, 1)
-  logit = jnp.clip(logits[label], _EPSILON, 1.0 - _EPSILON)
+  logit = jnp.maximum(_EPSILON, jnp.minimum(1.0 - _EPSILON, logits[label]))
   return c * -alpha * ((1 - logit)**gamma) * jnp.log(logit)
 
 
@@ -406,10 +406,18 @@ def train_retinanet_model(rng: jnp.array,
 
   # Run the training loop
   train_iter = iter(train_data)
+  print(f"Starting training loop at step {start_step}.")
   for step in range(start_step, warmup_steps + training_steps):
     batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
+    print(f"(Training Step #{step}) Getting input batch.")
     meta_state, loss = step_fn(batch, meta_state)
     print(f"(Train Step #{step}) RetinaNet Loss: {loss}")
+
+    # if step % 10 == 0 and step != 0:
+    #   checkpoints.save_checkpoint(
+    #       "singl_thread_checkpoints", meta_state, meta_state.step, keep=10)
+
+    continue  # For now, skip evaluation
 
     # Evaluate and checkpoint the model
     if step % checkpoint_period == 0 and step != 0:

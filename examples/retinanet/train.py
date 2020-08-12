@@ -15,7 +15,7 @@ from typing import Any, Iterable, Mapping, Tuple
 import input_pipeline
 from model import create_retinanet
 
-_EPSILON =  1e-7
+_EPSILON = 1e-8
 
 
 @flax.struct.dataclass
@@ -149,8 +149,8 @@ def focal_loss(logits: jnp.array,
     The value of the Focal Loss for this anchor.
   """
   # Only consider foreground (1) and background (0) anchors for this loss
-  c = jnp.minimum(anchor_type + 1, 1)
-  logit = jnp.clip(logits[label], _EPSILON, 1.0 - _EPSILON)
+  c = jnp.minimum(anchor_type + 1.0, 1.0)
+  logit = jnp.maximum(_EPSILON, jnp.minimum(1.0 - _EPSILON, logits[label]))
   return c * -alpha * ((1 - logit)**gamma) * jnp.log(logit)
 
 
@@ -168,7 +168,7 @@ def smooth_l1(regressions: jnp.array, targets: jnp.array,
     The value of the Smooth-L1 loss for this anchor.
   """
   # Only consider foreground (1) anchors for this loss
-  c = jnp.maximum(anchor_type, 0)
+  c = jnp.maximum(anchor_type, 0.0)
   deltas = regressions - targets
   return c * jnp.sum(
       jnp.where(
@@ -453,6 +453,12 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
       if jax.host_id() == 0:
         eval_to_tensorboard(summary_writer, running_metrics, step)
         running_metrics.clear()
+
+    # Do some checkpointing 
+    if step % 100 == 0 and step != 0:
+      meta_state = sync_model_state(meta_state)
+      checkpoint_state(meta_state)
+
     continue
 
     # Sync the model state, Evaluate and checkpoint the model
