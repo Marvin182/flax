@@ -172,3 +172,77 @@ def tf_jaccard_index(rects: tf.Tensor):
 
   # Return the IoU
   return intersection / union
+
+
+def non_max_suppression(bboxes, scores, t):
+  """Implements the Non-Maximum Suppression algorithm.
+
+  More specifically, this algorithm retains the bboxes based on their scores 
+  (those that have a higher score are favored), and IoU's with the other bboxes
+  (bboxes that have a high overlap with bboxes with higher scores are removed).
+
+  Args:
+    bboxes: a matrix of the form (|B|, 4), where |B| is the number of bboxes,
+      and the columns represent the coordinates of each bbox: [x1, y1, x2, y2]
+    scores: a vector of the form (|B|,) storing the confidence in each bbox
+    t: the IoU threshold; overlap above this threshold with higher scoring 
+      bboxes will imply the lower scoring bbox should be discarded
+
+  Returns:
+    The indexes of the bboxes which are retained after NMS is applied.
+  """
+  selected_idx = []
+
+  # Split the bboxes so they're easier to manipulate throughout
+  x1 = bboxes[:, 0]
+  y1 = bboxes[:, 1]
+  x2 = bboxes[:, 2]
+  y2 = bboxes[:, 3]
+
+  sorted_idx = jnp.argsort(scores)
+  areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+
+  while sorted_idx.shape[0] > 0:
+    # Select the index of the bbox with the highest score
+    current = sorted_idx[-1]
+    selected_idx.append(current)
+
+    # Determine the height and width of the intersections with the current bbox
+    xx1 = jnp.maximum(x1[current], x1[sorted_idx[:-1]])
+    yy1 = jnp.maximum(y1[current], y1[sorted_idx[:-1]])
+    xx2 = jnp.minimum(x2[current], x2[sorted_idx[:-1]])
+    yy2 = jnp.minimum(y2[current], y2[sorted_idx[:-1]])
+
+    width = jnp.maximum(0.0, xx2 - xx1 + 1)
+    height = jnp.maximum(0.0, yy2 - yy1 + 1)
+
+    # Compute the IoU between the current bbox and all the other bboxes
+    intersection = width * height
+    ious = intersection / (
+        areas[current] + areas[sorted_idx[:-1]] - intersection)
+
+    # Keep only the bboxes with the lower threshold
+    sorted_idx = sorted_idx[jnp.where(ious < t)[0]]
+
+  # Return the indexes of the non-suppressed bboxes
+  selected_idx = jnp.array(selected_idx, dtype=jnp.int32)
+  return jnp.array(bboxes[selected_idx, :]), selected_idx
+
+
+def top_k(scores, k, t=0.0):
+  """Applies top k selection on the `scores` parameter.
+
+  Args:
+    scores: a vector of arbitrary length, containing non-negative scores, from 
+      which only the at most top `k` highest scoring entries are selected.
+    k: the maximal number of elements to be selected from `scores`
+    t: a thresholding parameter (inclusive) which is applied on `scores`; 
+      elements failing to meet the threshold are removed 
+
+  Returns:
+    Top top k entries from `scores` after thresholding with `t` is applied,
+    as well as their indexes in the original vector.
+  """
+  idx = jnp.argsort(scores)[-k:]
+  idx = idx[jnp.where(scores[idx] >= t)[0]]
+  return scores[idx], idx
