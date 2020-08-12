@@ -28,7 +28,7 @@ def get_config():
 
   config.learning_rate = 0.01
   config.per_device_batch_size = 2
-  config.num_train_steps = 200
+  config.num_train_steps = 90_000
   config.warmup_steps = 30_000
   config.half_precision = False
   config.try_restore = False
