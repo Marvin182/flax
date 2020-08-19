@@ -1,6 +1,7 @@
 from jax import numpy as jnp
 
 import jax
+import numpy as np
 import tensorflow as tf
 
 CATEGORY_MAP = {
@@ -328,6 +329,7 @@ def filter_by_score(bboxes,
 
 def batch_filter_by_score(bboxes,
                           scores,
+                          max_rows,
                           score_threshold: float = 0.05,
                           k: int = 1000,
                           per_class=False):
@@ -341,6 +343,8 @@ def batch_filter_by_score(bboxes,
       coordinates: [x1, y1, x2, y2]   
     scores: a matrix of the shape (N, |B|, K), where K is the number of classes;
       each entry in a row will store the classification confidence of that class
+    max_rows: a scalar which indicates the number of output rows for each data
+      structure, obtained either through padding or trimming 
     score_threshold: bboxes having a confidence score lower than this parameter
       will be discarded.
     k: the `k` parameter of the top k selection. This value will also be used
@@ -353,7 +357,6 @@ def batch_filter_by_score(bboxes,
     A tuple containing: the number of true bboxes (i.e. not obtained through
     padding), the padded bboxes, the padded scores, the padded labels.  
   """
-  pad_target = k if not per_class else k * scores.shape[-1]
 
   def _inner(idx):
     # Isolate the relevant image data and apply the filtering
@@ -362,32 +365,182 @@ def batch_filter_by_score(bboxes,
     temp_bbox, temp_scores, temp_labels = filter_by_score(
         temp_bboxes, temp_scores, score_threshold, k, per_class)
 
-    # Pad if necessary
+    # Pad or trim if necessary
     count = temp_bbox.shape[0]
-    if count < pad_target:
-      delta = pad_target - temp_bbox.shape[0]
+    if count < max_rows:
+      delta = max_rows - count
       temp_bbox = vertical_pad(temp_bbox, delta)
       temp_scores = vertical_pad(temp_scores, delta)
       temp_labels = vertical_pad(temp_labels, delta)
+    elif count > max_rows:
+      # Skip the first rows, as those have lower confidence
+      temp_bbox = temp_bbox[-max_rows:, ...]
+      temp_scores = temp_scores[-max_rows:]
+      temp_labels = temp_labels[-max_rows:]
 
     return count, temp_bbox, temp_scores, temp_labels
 
   # Create the structures which will store the filtered bboxes
   batch_size = bboxes.shape[0]
-  counts = np.zeros((batch_size))
-  filtered_bboxes = np.zeros((batch_size, pad_target, 4))
-  filtered_scores = np.zeros((batch_size, pad_target))
-  filtered_labels = np.zeros((batch_size, pad_target))
+  counts = np.zeros(batch_size, dtype=int)
+  filtered_bboxes = np.zeros((batch_size, max_rows, 4))
+  filtered_scores = np.zeros((batch_size, max_rows))
+  filtered_labels = np.zeros((batch_size, max_rows), dtype=int)
 
   # Apply the filtering function on each batch entry
-  # FIXME: Find a way to do this in parallel 
+  # FIXME: Find a way to do this in parallel
   for idx, pack in enumerate(map(_inner, np.arange(batch_size))):
     counts[idx], filtered_bboxes[idx], filtered_scores[idx], filtered_labels[
         idx] = pack
 
   # Convert to jnp and return
-  counts = jnp.array(counts)
+  counts = jnp.array(counts, dtype=jnp.int32)
   filtered_bboxes = jnp.array(filtered_bboxes)
   filtered_scores = jnp.array(filtered_scores)
-  filtered_labels = jnp.array(filtered_labels)
+  filtered_labels = jnp.array(filtered_labels, dtype=jnp.int32)
   return counts, filtered_bboxes, filtered_scores, filtered_labels
+
+
+def generate_inferences(bboxes,
+                        scores,
+                        labels,
+                        counts,
+                        nms=True,
+                        classes=-1,
+                        per_class=False,
+                        iou_threshold=0.5,
+                        max_outputs=100):
+  """Generates the batch bbox predictions.
+
+  More specifically, given a dictionary which stores the filtered outputs 
+  of the regression and classification subnets, this function generates the 
+  final predictions for the batch, by concatenating the valid parts of 
+  the outputs together. This method can optionally also apply Non-Maximum 
+  Suppression (NMS) on the input. NMS can be applied at a per-class level 
+  or on all the classes at the same time.  
+
+  Args:
+    bboxes: an array having the dimensions (N, L, A, 4), where `N` is the batch
+      size, `L` is the number of levels, and `A` is the number of (padded) 
+      anchors; this stores the 4 anchor coordinates.
+    scores: an array having the shape (N, L, A), which stores the score 
+      associated with each anchor
+    labels: an array having the shape (N, L, A), which stores the label 
+      associated with each anchor
+    counts: an array of the shape (N, L), which stores the number of true
+      anchors; this number is useful towards discarding the padded anchors
+    nms: if True, enables the use of NMS
+    classes: the number of classes in the classification task; if `per_class`
+      is True, this argument must also be specified
+    per_class: if True enables NMS on a per-class level
+    max_outputs: a scalar which indicates the maximal number of predicted bboxes
+      generated by this method. If there are fewer than predictions, then the
+      outputs will be padded. 
+
+  Returns:
+    A dictionary of the following form:
+
+    ```
+    {
+      "counts": <count_list>,  # Shape: (<batch_size>)
+      "bboxes": <bboxes>,  # Shape: (<batch_size, max_outputs, 4>)
+      "scores": <scores>,  # Shape: (<batch_size, max_outputs>)
+      "labels": <labels>   # Shape: (<batch_size, max_outputs>)
+    }
+    ```
+
+    Here, `counts` holds the number of usable elements, as the output will be 
+    automatically padded or trimmed to `max_outputs`
+  """
+  assert not per_class or per_class and classes > 0, "If per_class is True, " \
+    "then classes must be a positive integer"
+
+  def _inner(idx):
+    # Isolate the relevant image data
+    t_bboxes = bboxes[idx, ...]
+    t_scores = scores[idx, ...]
+    t_labels = labels[idx, ...]
+    t_counts = counts[idx]
+
+    # Prepare the accumulators
+    acc_bboxes = jnp.zeros((0, 4))
+    acc_scores = jnp.zeros(0)
+    acc_labels = jnp.zeros(0, dtype=jnp.int32)
+
+    # Concatenate the image data into one
+    levels = t_bboxes.shape[0]
+    for i in range(levels):
+      count = t_counts[i]
+      acc_bboxes = jnp.append(acc_bboxes, t_bboxes[i, :count, :], axis=0)
+      acc_scores = jnp.append(acc_scores, t_scores[i, :count], axis=0)
+      acc_labels = jnp.append(acc_labels, t_labels[i, :count], axis=0)
+
+    # Apply NMS if requested
+    if nms:
+      if per_class:
+        # Create new acc datastructures
+        t_acc_bboxes = jnp.zeros((0, 4))
+        t_acc_scores = jnp.zeros(0)
+        t_acc_labels = jnp.zeros(0, dtype=jnp.int32)
+
+        # Apply NMS for each label
+        for i in range(classes):
+          # Isolate the label data
+          idx = jnp.where(acc_labels == i)[0]
+          t_bboxes = acc_bboxes[idx]
+          t_scores = acc_scores[idx]
+          t_labels = acc_labels[idx]
+
+          # Apply NMS and isolate the data of the top bboxes
+          t_bboxes, nms_idx = non_max_suppression(t_bboxes, t_scores,
+                                                  iou_threshold)
+          t_scores = t_scores[nms_idx]
+          t_labels = t_labels[nms_idx]
+
+          # Append the filtered bboxes
+          t_acc_bboxes = jnp.append(t_acc_bboxes, t_bboxes, axis=0)
+          t_acc_scores = jnp.append(t_acc_scores, t_scores, axis=0)
+          t_acc_labels = jnp.append(t_acc_labels, t_labels, axis=0)
+
+        # Apply top-k selection based on confidence
+        acc_scores, idx = top_k(t_acc_scores, max_outputs)
+        acc_bboxes = t_acc_bboxes[idx]
+        acc_labels = t_acc_labels[idx]
+      else:
+        acc_bboxes, nms_idx = non_max_suppression(acc_bboxes, acc_scores,
+                                                  iou_threshold)
+        acc_scores = acc_scores[nms_idx]
+        acc_labels = acc_labels[nms_idx]
+
+    # Pad or trim the outputs such that they have `max_outputs` rows
+    count = acc_bboxes.shape[0]
+    if count < max_outputs:
+      delta = max_outputs - count
+      acc_bboxes = vertical_pad(acc_bboxes, delta)
+      acc_scores = vertical_pad(acc_scores, delta)
+      acc_labels = vertical_pad(acc_labels, delta)
+    elif count > max_outputs:
+      acc_bboxes = acc_bboxes[:max_outputs, ...]
+      acc_scores = acc_scores[:max_outputs]
+      acc_labels = acc_labels[:max_outputs]
+
+    # Return the results of this stage
+    return count, acc_bboxes, acc_scores, acc_labels
+
+  # Determine the batch size and initialize accumulator datastructures
+  batch_size = bboxes.shape[0]
+  f_counts = np.zeros(batch_size, dtype=int)
+  f_bboxes = np.zeros((batch_size, max_outputs, 4))
+  f_scores = np.zeros((batch_size, max_outputs))
+  f_labels = np.zeros((batch_size, max_outputs), dtype=int)
+
+  for idx, pack in enumerate(map(_inner, np.arange(batch_size))):
+    f_counts[idx], f_bboxes[idx], f_scores[idx], f_labels[idx] = pack
+
+  # Return the filtered structures
+  return {
+      "counts": jnp.array(f_counts, dtype=jnp.int32),
+      "bboxes": jnp.array(f_bboxes),
+      "scores": jnp.array(f_scores),
+      "labels": jnp.array(f_labels, dtype=jnp.int32)
+  }
