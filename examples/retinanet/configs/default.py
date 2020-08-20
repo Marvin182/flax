@@ -22,7 +22,7 @@ class ConfigDict(dict):
     del self.__dict__[key]
 
 
-def get_default_config():
+def get_config():
   """Get the default hyperparameter configuration."""
   config = ConfigDict()
 
@@ -34,10 +34,6 @@ def get_default_config():
   config.try_restore = False
   config.distributed_training = True
   config.dtype = float32
-
-  # Configurations for the image sizes (in px) after rescaling
-  config.img_min_side = 224
-  config.img_max_side = 224
 
   # The number of layers in the RetinaNet backbone.
   config.depth = 50
