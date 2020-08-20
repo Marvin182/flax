@@ -240,7 +240,8 @@ def eval_step(data, meta_state):
     The accuracy and the Log-loss aggregated across multiple workers.
   """
   with flax.nn.stateful(meta_state.model_state, mutable=False):
-    pred = meta_state.optimizer.target(data['image'], train=False)
+    pred = meta_state.optimizer.target(
+        data['image'], img_shape=data['size'], train=False)
   return compute_metrics(pred, data['label'])
 
 
@@ -430,32 +431,30 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
   train_iter = iter(train_data)
   report_progress = hooks.ReportProgress(num_train_steps=config.num_train_steps)
   logging.info("Starting training loop at step %d.", start_step)
-  for step in range(start_step, config.num_train_steps + 1):
-    with jax.profiler.StepTraceContext("train", step_num=step):
-      batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
-      meta_state, metrics = p_step_fn(batch, meta_state)
+  for step in range(start_step, config.num_train_steps + config.warmup_steps):
+    batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
+    logging.info("(Training Step #%d) Getting input batch.", step)
+    meta_state, metrics = p_step_fn(batch, meta_state)
 
-      # Let's talk about this next week. Logging the loss here every step
-      # removes the benefit of the asynchronous dispatch in JAX.
-      # Log the loss for this batch
-      # running_metrics.append(metrics)
-      # metrics = jax.device_get(jax.tree_map(lambda x: x[0], metrics))
-      # logging.info("(Training Step #%d) RetinaNet loss: %s.", step, metrics)
+    # Log the loss for this batch
+    running_metrics.append(metrics)
+    metrics = jax.device_get(jax.tree_map(lambda x: x[0], metrics))
+    logging.info("(Training Step #%d) RetinaNet loss: %s.", step, metrics)
 
-    # Quick indication that training is happening.
-    logging.log_first_n(logging.INFO, "Finished training step %d.", 20, step)
-    report_progress(step, time.time())
+    # Periodically sync the model state
+    if step % config.sync_steps == 0 and step != 0:
+      meta_state = sync_model_state(meta_state)
 
-    if step % 50 == 0:
-      logging.info("[%d] metrics from train step: %s", step, metrics)
-    # # Periodically sync the model state
-    # if step % config.sync_steps == 0 and step != 0:
-      # meta_state = sync_model_state(meta_state)
+      # Submit the metrics to tensorboard
+      if jax.host_id() == 0:
+        eval_to_tensorboard(summary_writer, running_metrics, step)
+        running_metrics.clear()
 
-      # # Submit the metrics to tensorboard
-      # if jax.host_id() == 0:
-        # eval_to_tensorboard(summary_writer, running_metrics, step)
-        # running_metrics.clear()
+    # Do some checkpointing
+    if step % 100 == 0 and step != 0:
+      meta_state = sync_model_state(meta_state)
+      checkpoint_state(meta_state)
+
     continue
 
     # Sync the model state, Evaluate and checkpoint the model

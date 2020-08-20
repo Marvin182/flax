@@ -503,6 +503,7 @@ class DataPreprocessor:
 
     def _inner(data):
       # Unpack the dataset elements
+      image_id = data["image/id"]
       image = data["image"]
       is_crowd = data["objects"]["is_crowd"]
       labels = data["objects"]["label"] + self.label_shift
@@ -535,7 +536,9 @@ class DataPreprocessor:
 
       # Return the preprocessed batch
       return {
+          "id": image_id,
           "image": new_image,
+          "scale": ratio,
           "size": [
               tf.cast(new_image_h, tf.int32),
               tf.cast(new_image_w, tf.int32), new_image_c
