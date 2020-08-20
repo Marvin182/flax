@@ -1,5 +1,6 @@
 from typing import Iterable, Tuple
 
+from clu import deterministic_data
 from flax import jax_utils
 import jax
 import jax.numpy as jnp
@@ -8,7 +9,6 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 
 from anchor import generate_all_anchors, AnchorConfig
-import deterministic_data
 from util import tf_jaccard_index
 
 # This controls the maximal number of bbox annotations in an image

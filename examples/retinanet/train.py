@@ -2,6 +2,7 @@ import math
 import time
 
 from absl import logging
+from clu import hooks
 from configs.default import ConfigDict
 import flax
 from flax.metrics import tensorboard
@@ -14,7 +15,6 @@ import sys
 from typing import Any, Iterable, Mapping, Tuple
 
 import input_pipeline
-import hooks
 from model import create_retinanet
 
 _EPSILON = 1e-8
@@ -433,7 +433,6 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
   logging.info("Starting training loop at step %d.", start_step)
   for step in range(start_step, config.num_train_steps + config.warmup_steps):
     batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
-    logging.info("(Training Step #%d) Getting input batch.", step)
     meta_state, metrics = p_step_fn(batch, meta_state)
 
     # Quick indication that training is happening.
@@ -442,8 +441,6 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
 
     # Log the loss for this batch
     running_metrics.append(metrics)
-    metrics = jax.device_get(jax.tree_map(lambda x: x[0], metrics))
-    logging.info("(Training Step #%d) RetinaNet loss: %s.", step, metrics)
 
     # Periodically sync the model state
     if step % config.sync_steps == 0 and step != 0:
