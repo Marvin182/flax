@@ -435,6 +435,10 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
     logging.info("(Training Step #%d) Getting input batch.", step)
     meta_state, metrics = p_step_fn(batch, meta_state)
 
+    # Quick indication that training is happening.
+    logging.log_first_n(logging.INFO, "Finished training step %d!", 10, step)
+    report_progress(step, time.time())
+
     # Log the loss for this batch
     running_metrics.append(metrics)
     metrics = jax.device_get(jax.tree_map(lambda x: x[0], metrics))
