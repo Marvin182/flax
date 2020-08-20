@@ -314,6 +314,8 @@ class RetinaNet(flax.nn.Module):
             anchor_values=4,
             classes=1000,
             train=True,
+            k=100,
+            per_class=True,
             anchors_config=None,
             dtype=jnp.float32):
     """Applies the RetinaNet architecture.
@@ -327,6 +329,8 @@ class RetinaNet(flax.nn.Module):
       anchor_values: the number of values which characterizes an anchor
       classes: the number of classes for the object detection task
       train: indicates if the model is being used for training
+      k: the `k` used in top k filtering
+      per_class: True if filtering and NMS should be applied per class level
       anchors_config: an AnchorConfig object, with relevant information for
                       unpacking the anchors at various scales
       dtype: the data type of the model
@@ -357,10 +361,17 @@ class RetinaNet(flax.nn.Module):
         anchors=anchors,
         dtype=dtype)
 
-    # Obtain regresssions and classifications from P3 to P7
-    bboxes = jnp.zeros((data.shape[0], 0, 4), dtype=dtype)
+    # Initialize structures relevant for training
     regressions = jnp.zeros((data.shape[0], 0, 4), dtype=dtype)
     classifications = jnp.zeros((data.shape[0], 0, classes), dtype=jnp.int32)
+
+    # Initialize structures relevant for inference
+    if not train:
+      max_rows = k * classes if per_class else k
+      i_bboxes = jnp.zeros((data.shape[0], 0, max_rows, 4), dtype=dtype)
+      i_scores = jnp.zeros((data.shape[0], 0, max_rows), dtype=dtype)
+      i_labels = jnp.zeros((data.shape[0], 0, max_rows), dtype=jnp.int32)
+      i_counts = jnp.zeros((data.shape[0], 0), dtype=jnp.int32)
 
     for idx, layer_idx in enumerate(range(3, 8)):
       # Get the feature maps for this subnet
@@ -376,14 +387,43 @@ class RetinaNet(flax.nn.Module):
 
       # If not training, then expand the anchors and apply regressions
       if not train:
+        # TODO: Consider moving this to its own flax.nn.Module
         anchors = generate_anchors(layer_input.shape[:3],
                                    anchors_config.strides[idx],
                                    anchors_config.sizes[idx],
                                    anchors_config.ratios, anchors_config.scales,
                                    dtype)
+
+        # Apply regressions on the anchors
         bboxes_temp = apply_anchor_regressions(
             anchors, regressions_temp, dtype=dtype)
-        bboxes = jnp.append(bboxes, bboxes_temp, axis=1)
+
+        # Filter out less promising anchors
+        t_counts, t_bboxes, t_scores, t_labels = batch_filter_by_score(
+            anchors, classifications_temp, max_rows, per_class=False)
+
+        # Append level's filtered outputs
+        t_bboxes = jnp.expand_dims(t_bboxes, axis=1)
+        t_scores = jnp.expand_dims(t_scores, axis=1)
+        t_labels = jnp.expand_dims(t_labels, axis=1)
+        t_counts = jnp.expand_dims(t_counts, axis=1)
+
+        i_bboxes = jnp.append(i_bboxes, t_bboxes, axis=1)
+        i_scores = jnp.append(i_scores, t_scores, axis=1)
+        i_labels = jnp.append(i_labels, t_labels, axis=1)
+        i_counts = jnp.append(i_counts, t_counts, axis=1)
+
+    # If in inference mode, apply nms on all the image's filtered anchors
+    bboxes = None
+    if not train:
+      bboxes = generate_inferences(
+          i_bboxes,
+          i_scores,
+          i_labels,
+          i_counts,
+          classes=classes,
+          per_class=False,
+          max_outputs=300)
 
     # Return the regressions, classifications, and bboxes
     return classifications, regressions, bboxes

@@ -17,7 +17,7 @@ import input_pipeline
 import hooks
 from model import create_retinanet
 
-_EPSILON =  1e-7
+_EPSILON = 1e-8
 
 
 @flax.struct.dataclass
@@ -151,8 +151,8 @@ def focal_loss(logits: jnp.array,
     The value of the Focal Loss for this anchor.
   """
   # Only consider foreground (1) and background (0) anchors for this loss
-  c = jnp.minimum(anchor_type + 1, 1)
-  logit = jnp.clip(logits[label], _EPSILON, 1.0 - _EPSILON)
+  c = jnp.minimum(anchor_type + 1.0, 1.0)
+  logit = jnp.maximum(_EPSILON, jnp.minimum(1.0 - _EPSILON, logits[label]))
   return c * -alpha * ((1 - logit)**gamma) * jnp.log(logit)
 
 
@@ -170,7 +170,7 @@ def smooth_l1(regressions: jnp.array, targets: jnp.array,
     The value of the Smooth-L1 loss for this anchor.
   """
   # Only consider foreground (1) anchors for this loss
-  c = jnp.maximum(anchor_type, 0)
+  c = jnp.maximum(anchor_type, 0.0)
   deltas = regressions - targets
   return c * jnp.sum(
       jnp.where(
@@ -430,32 +430,30 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
   train_iter = iter(train_data)
   report_progress = hooks.ReportProgress(num_train_steps=config.num_train_steps)
   logging.info("Starting training loop at step %d.", start_step)
-  for step in range(start_step, config.num_train_steps + 1):
-    with jax.profiler.StepTraceContext("train", step_num=step):
-      batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
-      meta_state, metrics = p_step_fn(batch, meta_state)
+  for step in range(start_step, config.num_train_steps + config.warmup_steps):
+    batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
+    logging.info("(Training Step #%d) Getting input batch.", step)
+    meta_state, metrics = p_step_fn(batch, meta_state)
 
-      # Let's talk about this next week. Logging the loss here every step
-      # removes the benefit of the asynchronous dispatch in JAX.
-      # Log the loss for this batch
-      # running_metrics.append(metrics)
-      # metrics = jax.device_get(jax.tree_map(lambda x: x[0], metrics))
-      # logging.info("(Training Step #%d) RetinaNet loss: %s.", step, metrics)
+    # Log the loss for this batch
+    running_metrics.append(metrics)
+    metrics = jax.device_get(jax.tree_map(lambda x: x[0], metrics))
+    logging.info("(Training Step #%d) RetinaNet loss: %s.", step, metrics)
 
-    # Quick indication that training is happening.
-    logging.log_first_n(logging.INFO, "Finished training step %d.", 20, step)
-    report_progress(step, time.time())
+    # Periodically sync the model state
+    if step % config.sync_steps == 0 and step != 0:
+      meta_state = sync_model_state(meta_state)
 
-    if step % 50 == 0:
-      logging.info("[%d] metrics from train step: %s", step, metrics)
-    # # Periodically sync the model state
-    # if step % config.sync_steps == 0 and step != 0:
-      # meta_state = sync_model_state(meta_state)
+      # Submit the metrics to tensorboard
+      if jax.host_id() == 0:
+        eval_to_tensorboard(summary_writer, running_metrics, step)
+        running_metrics.clear()
 
-      # # Submit the metrics to tensorboard
-      # if jax.host_id() == 0:
-        # eval_to_tensorboard(summary_writer, running_metrics, step)
-        # running_metrics.clear()
+    # Do some checkpointing 
+    if step % 100 == 0 and step != 0:
+      meta_state = sync_model_state(meta_state)
+      checkpoint_state(meta_state)
+
     continue
 
     # Sync the model state, Evaluate and checkpoint the model

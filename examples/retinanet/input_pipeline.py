@@ -270,24 +270,38 @@ class DataPreprocessor:
 
     Args:
       anchors: an (|A|, 4) matrix for the anchors.
-      bboxes: a (|B|, 4) matrix for the bboxes.
+      bboxes: a (|B|, 4) matrix for the ground truth bboxes.
 
     Returns:
       An (|A|, |B|) matrix, where each entry stores the IoU of an anchor and
       a bbox.
     """
-    bbox_count = tf.shape(bboxes)[0]
-    anchor_count = tf.shape(anchors)[0]
+    # Compute the areas of each of the ground truth bboxes
+    area_bbox = (bboxes[:, 2] - bboxes[:, 0] + 1) * (
+        bboxes[:, 3] - bboxes[:, 1] + 1)
+    area_anchor = (anchors[:, 2] - anchors[:, 0] + 1) * (
+        anchors[:, 3] - anchors[:, 1] + 1)
 
-    # Compute the Cartesian Product between the anchors and the bboxes
-    repeats = tf.ones(anchor_count, dtype=tf.int32) * bbox_count
-    anchors = tf.repeat(anchors, repeats, axis=0)
-    bboxes = tf.tile(bboxes, [anchor_count, 1])
+    # Compute the intersection across the axes
+    h_intersections = tf.minimum(
+        tf.expand_dims(anchors[:, 2], axis=1), bboxes[:, 2]) - tf.maximum(
+            tf.expand_dims(anchors[:, 0], axis=1), bboxes[:, 0]) + 1
+    v_intersections = tf.minimum(
+        tf.expand_dims(anchors[:, 3], axis=1), bboxes[:, 3]) - tf.maximum(
+            tf.expand_dims(anchors[:, 1], axis=1), bboxes[:, 1]) + 1
 
-    # Compute the overlaps
-    overlaps = tf.map_fn(
-        tf_jaccard_index, (anchors, bboxes), fn_output_signature=tf.float32)
-    return tf.reshape(overlaps, [anchor_count, bbox_count])
+    # Compute the area of intersection
+    h_intersections = tf.maximum(h_intersections, 0)
+    v_intersections = tf.maximum(v_intersections, 0)
+    intersections = h_intersections * v_intersections
+
+    # Compute the unions of the areas
+    unions = tf.expand_dims(
+        area_anchor, axis=1) + area_bbox - h_intersections * v_intersections
+    unions = tf.maximum(unions, 1e-8)  # Avoid division by 0
+
+    # Compute the IoU and return it
+    return intersections / unions
 
   def compute_foreground_ignored(self, overlaps: tf.Tensor):
     """Identifies the row indices of the foreground and ignored anchors.
