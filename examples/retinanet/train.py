@@ -238,7 +238,8 @@ def eval_step(data, meta_state):
     The accuracy and the Log-loss aggregated across multiple workers.
   """
   with flax.nn.stateful(meta_state.model_state, mutable=False):
-    pred = meta_state.optimizer.target(data['image'], train=False)
+    pred = meta_state.optimizer.target(
+        data['image'], img_shape=data['size'], train=False)
   return compute_metrics(pred, data['label'])
 
 
@@ -454,7 +455,7 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
         eval_to_tensorboard(summary_writer, running_metrics, step)
         running_metrics.clear()
 
-    # Do some checkpointing 
+    # Do some checkpointing
     if step % 100 == 0 and step != 0:
       meta_state = sync_model_state(meta_state)
       checkpoint_state(meta_state)

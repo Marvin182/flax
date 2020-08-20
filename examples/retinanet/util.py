@@ -108,72 +108,29 @@ def pi_init(pi):
   return _inner
 
 
-def get_intersection(rect1, rect2):
-  """Computes the intersection between two rectangles.
+@jax.vmap
+def clip_anchors(anchors, height, width):
+  """Clips anchors to height and width of image.
+
+  More specifically, the x coordinates of the base anchors are clipped,
+  such that they are always found in the `[0, width]` interval, and
+  the `y` coordinates are always found in the `[0, height]` interval.
 
   Args:
-    rect1: a list or tuple, which contains the coordinates of the top left and
-           bottom right corners respectively: [x1, y1, x2, y2].
-    rect2: a list or tuple, which contains the coordinates of the top left and
-           bottom right corners respectively: [x1, y1, x2, y2].
+    anchors: a tensor of the shape (|A|, 4) where each row contains 
+      the `[x1, y1, x2, y1]` of that anchor
+    height: the height of the image
+    width: the width of the image
 
   Returns:
-    The area of the intersection of the two rectangles
+    A matrix of the form (|A|, 4), which contains the clipped anchors, as well
+    as an extra column which can be used to store the status of the anchor.
   """
-  overlap_x = max(0, min(rect1[2], rect2[2]) - max(rect1[0], rect2[0]))
-  overlap_y = max(0, min(rect1[3], rect2[3]) - max(rect1[1], rect2[1]))
-  return overlap_x * overlap_y
-
-
-def jaccard_index(rect1, rect2):
-  """Compute the Jaccard index of two rectangles.
-
-  Args:
-    rect1: a list or tuple, which contains the coordinates of the top left and
-           bottom right corners respectively: [x1, y1, x2, y2].
-    rect2: a list or tuple, which contains the coordinates of the top left and
-           bottom right corners respectively: [x1, y1, x2, y2].
-
-  Returns:
-    The IoU of the two rectangles
-  """
-  # Get the intersection
-  intersection = get_intersection(rect1, rect2)
-
-  # Get the union value
-  area1 = (rect1[2] - rect1[0]) * (rect1[3] - rect1[1])
-  area2 = (rect2[2] - rect2[0]) * (rect2[3] - rect2[1])
-  union = area1 + area2 - intersection
-
-  # Return the IoU
-  return intersection / union
-
-
-@tf.function
-def tf_jaccard_index(rects: tf.Tensor):
-  rect1 = rects[0]
-  rect2 = rects[1]
-
-  # Compute the overlap on the X axis
-  left_x = tf.math.maximum(rect1[0], rect2[0])
-  right_x = tf.math.minimum(rect1[2], rect2[2])
-  overlap_x = tf.math.maximum(0.0, right_x - left_x)
-
-  # Compute the overlap on the Y axis
-  lo_y = tf.math.maximum(rect1[1], rect2[1])
-  hi_y = tf.math.minimum(rect1[3], rect2[3])
-  overlap_y = tf.math.maximum(0.0, hi_y - lo_y)
-
-  # Compute the area of the intersection
-  intersection = overlap_x * overlap_y
-
-  # Compute the area of the union
-  area1 = (rect1[2] - rect1[0]) * (rect1[3] - rect1[1])
-  area2 = (rect2[2] - rect2[0]) * (rect2[3] - rect2[1])
-  union = area1 + area2 - intersection
-
-  # Return the IoU
-  return intersection / union
+  x1 = jnp.clip(anchors[:, 0], 0, width)
+  y1 = jnp.clip(anchors[:, 1], 0, height)
+  x2 = jnp.clip(anchors[:, 2], 0, width)
+  y2 = jnp.clip(anchors[:, 3], 0, height)
+  return jnp.stack([x1, y1, x2, y2], axis=1)
 
 
 def non_max_suppression(bboxes, scores, t):
@@ -247,7 +204,7 @@ def vertical_pad(data, pad_count, dtype=jnp.float32):
   return jnp.append(data, pad_structure, axis=0)
 
 
-def top_k(scores, k, t=0.0):
+def _top_k(scores, k, t=0.0):
   """Applies top k selection on the `scores` parameter.
 
   Args:
@@ -261,9 +218,12 @@ def top_k(scores, k, t=0.0):
     Top top k entries from `scores` after thresholding with `t` is applied,
     as well as their indexes in the original vector.
   """
+  scores = jnp.where(scores >= t, scores, 0.0)
   idx = jnp.argsort(scores)[-k:]
-  idx = idx[jnp.where(scores[idx] >= t)[0]]
   return scores[idx], idx
+
+
+top_k = jax.vmap(_top_k, in_axes=(0, None, None))
 
 
 def filter_by_score(bboxes,
