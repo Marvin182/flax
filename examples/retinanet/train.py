@@ -1,6 +1,8 @@
 import math
+import time
 
 from absl import logging
+from clu import hooks
 from configs.default import ConfigDict
 import flax
 from flax.metrics import tensorboard
@@ -380,22 +382,14 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
   tf.io.gfile.makedirs(workdir)
   if jax.host_id() == 0:
     summary_writer = tensorboard.SummaryWriter(workdir)
-  # FIXME: Remove this hacky way of logging
-  logging.get_absl_handler().python_handler.stream = sys.stdout
 
   # Deterministic training, see go/deterministic training.
   rng = jax.random.PRNGKey(config.seed)
 
   # Set up the data pipeline
-  dataset_builder = tfds.builder("coco/2014")
-  num_classes = dataset_builder.info.features["objects"]["label"].num_classes
   rng, data_rng = jax.random.split(rng)
-  data = input_pipeline.read_data(data_rng)
-  train_data, val_data = input_pipeline.prepare_data(
-      data,
-      per_device_batch_size=config.per_device_batch_size,
-      distributed_training=config.distributed_training,
-      shape=[config.img_min_side, config.img_max_side])
+  ds_info, train_data, val_data = input_pipeline.create_datasets(config, data_rng)
+  num_classes = ds_info.features["objects"]["label"].num_classes
 
   logging.info("Training data shapes: %s", train_data.element_spec)
   input_shape = list(train_data.element_spec["image"].shape)[1:]
@@ -435,16 +429,18 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
   # Run the training loop
   running_metrics = []
   train_iter = iter(train_data)
+  report_progress = hooks.ReportProgress(num_train_steps=config.num_train_steps)
   logging.info("Starting training loop at step %d.", start_step)
   for step in range(start_step, config.num_train_steps + config.warmup_steps):
     batch = jax.tree_map(lambda x: x._numpy(), next(train_iter))  # pylint: disable=protected-access
-    logging.info("(Training Step #%d) Getting input batch.", step)
     meta_state, metrics = p_step_fn(batch, meta_state)
+
+    # Quick indication that training is happening.
+    logging.log_first_n(logging.INFO, "Finished training step %d!", 10, step)
+    report_progress(step, time.time())
 
     # Log the loss for this batch
     running_metrics.append(metrics)
-    metrics = jax.device_get(jax.tree_map(lambda x: x[0], metrics))
-    logging.info("(Training Step #%d) RetinaNet loss: %s.", step, metrics)
 
     # Periodically sync the model state
     if step % config.sync_steps == 0 and step != 0:

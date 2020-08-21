@@ -1,13 +1,15 @@
-from anchor import generate_all_anchors, AnchorConfig
-from flax import jax_utils
-from jax import numpy as jnp
-from os import getenv
 from typing import Iterable, Tuple
 
-import itertools
+from clu import deterministic_data
+from flax import jax_utils
 import jax
+import jax.numpy as jnp
+
 import tensorflow as tf
 import tensorflow_datasets as tfds
+
+from anchor import generate_all_anchors, AnchorConfig
+from util import tf_jaccard_index
 
 # This controls the maximal number of bbox annotations in an image
 MAX_PADDING_ROWS = 100
@@ -573,95 +575,76 @@ def is_annotated(data):
   return tf.math.greater(tf.size(data["objects"]["label"]), 0)
 
 
-def read_data(rng):
-  """Prepares an instance of the COCO dataset for object detection training.
+def get_coco_splits(rng):
+  """Returns splits for COCO/2014.
 
-  More specifically, reads the `COCO/2014` dataset and creates a `trainval35k` 
-  subset for training and uses the rest of the validation data for testing.
+  COCO/2014 comes with annotated train and validation split. It is common to use
+  a random 5504 example subset of the validation split for eval and include the
+  remaining validation examples in the training split.
 
   Args:
      rng: JAX PRNGKey.
 
   Returns:
-    A dictionary of the data, having the following shape:
-
-    ```
-    {
-      "train": train_data,
-      "test": test_data
-    }
-    ```
+    A tuple with the train and the eval split for TFDS.
   """
   # Values according to https://www.tensorflow.org/datasets/catalog/coco
-  VAL_SIZE = 5504
-  start = jax.random.randint(rng, (1,), 0, VAL_SIZE)[0]
+  EVAL_SIZE = 5504
+  start = jax.random.randint(rng, (1,), 0, EVAL_SIZE)[0]
   end = start + 35000
-
-  # Read and prepare the data
-  train_data, test_data = tfds.load(
-      "coco/2014",
-      split=[
-          "train+validation[{}:{}]".format(start, end),
-          "validation[:{}]+validation[{}:]".format(start, end)
-      ],
-      data_dir=getenv("TFDS_DATA_DIR"))
-
-  data = {"train": train_data, "test": test_data}
-  return data
+  return f"train+validation[{start}:{end}]", f"validation[:{start}]+validation[{end}:]"
 
 
-def prepare_data(
-    data: tf.data.Dataset,
-    per_device_batch_size: int,
-    distributed_training: bool = False,
-    shape: Iterable[int] = None) -> Tuple[tf.data.Dataset, tf.data.Dataset]:
-  """Process a COCO dataset, and produce training and testing input pipelines.
+def train_preprocess_fn(features):
+  fn = DataPreprocessor(min_size=224, max_size=224, label_shift=1)(augment_image=True)
+  return fn(features)
+
+
+def eval_preprocess_fn(features):
+  fn = DataPreprocessor(min_size=224, max_size=224, label_shift=1)(augment_image=False)
+  return fn(features)
+
+
+def create_datasets(config, rng) -> Tuple[tfds.core.DatasetInfo, tf.data.Dataset, tf.data.Dataset]:
+  """Create datasets for training and evaluation.
 
   Args:
-    data: a dictionary of the form: 
-    ``` 
-    {
-      "train": train_data,
-      "test": test_data
-    } 
-    ```
-    per_device_batch_size: The batch size per device (GPU or TPU core). E.g.
-      per_device_batch_size = global_batch_size // jax.device_count().
-    distributed_training: True if the data is prepare for distributed training,
-      and hence will require an additional dimension for the number of devices
-    shape: an iterable data structure of two elements: `[min_side_size,
-      max_side_size]` specified in pixels
+    config: Configuration to use.
+    rng: PRNGKey for seeding operations in the training dataset.
 
   Returns:
-    A tuple containing the preprocessed datasets for training and testing.
+    A tuple with the dataset info, the training dataset and the evaluation
+    dataset.
   """
-  if not shape:
-    shape = (600, 1000)
+  if jax.host_count() > 1:
+    # We could need to make sure that different hosts get different parts of
+    # the dataset. During training this might happen implicitly due to the
+    # shuffling. During evaluation we need to distribute the eval dataset.
+    raise NotImplementedError("The input pipeline does not yet support"
+                              "distributed training with multiple hosts.")
 
-  # Note: we shift the labels by 1 since 0 is reserved for background
-  batch_preprocessor = DataPreprocessor(
-      min_size=shape[0], max_size=shape[1], label_shift=1)
-  autotune = tf.data.experimental.AUTOTUNE
+  split_rng, train_shuffle_rng = jax.random.split(rng)
+  train_split, eval_split = get_coco_splits(split_rng)
+  train_shuffle_rng = jax.random.fold_in(train_shuffle_rng, jax.host_id())
 
-  # Define the relevant leading dimensions for the batch
-  if distributed_training:
-    batch_dims = [jax.local_device_count(), per_device_batch_size]
-    device_count = batch_dims[0]
-  else:
-    device_count = 1
-    batch_dims = [per_device_batch_size]
+  dataset_builder = tfds.builder("coco/2014")
+  train_ds = deterministic_data.create_dataset(
+      dataset_builder,
+      split=train_split,
+      rng=train_shuffle_rng,
+      filter_fn=is_annotated,
+      preprocess_fn=train_preprocess_fn,
+      shuffle_buffer_size=1000,
+      batch_dims=[jax.local_device_count(), config.per_device_batch_size],
+      num_epochs=None,
+      shuffle=True)
+  eval_ds = deterministic_data.create_dataset(
+      dataset_builder,
+      split=eval_split,
+      filter_fn=is_annotated,
+      preprocess_fn=eval_preprocess_fn,
+      batch_dims=[jax.local_device_count(), config.per_device_batch_size],
+      num_epochs=1,
+      shuffle=False)
 
-  # Prepare training data: standardize, resize and randomly flip the images
-  train = data["train"].filter(is_annotated).repeat().shuffle(
-      device_count * per_device_batch_size * 16, seed=0).map(
-          batch_preprocessor(augment_image=True), num_parallel_calls=autotune)
-  for batch_size in reversed(batch_dims):
-    train = train.batch(batch_size, drop_remainder=True)
-
-  # Prepare the test data: only standardize and resize
-  test = data["test"].filter(is_annotated).map(
-      batch_preprocessor(), num_parallel_calls=autotune)
-  for batch_size in reversed(batch_dims):
-    test = test.batch(batch_size, drop_remainder=True)
-
-  return train, test
+  return dataset_builder.info, train_ds, eval_ds
