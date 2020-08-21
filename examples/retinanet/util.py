@@ -126,10 +126,10 @@ def clip_anchors(anchors, height, width):
     A matrix of the form (|A|, 4), which contains the clipped anchors, as well
     as an extra column which can be used to store the status of the anchor.
   """
-  x1 = jnp.clip(anchors[:, 0], 0, width)
-  y1 = jnp.clip(anchors[:, 1], 0, height)
-  x2 = jnp.clip(anchors[:, 2], 0, width)
-  y2 = jnp.clip(anchors[:, 3], 0, height)
+  x1 = jnp.clip(anchors[:, 0], 0.0, width)
+  y1 = jnp.clip(anchors[:, 1], 0.0, height)
+  x2 = jnp.clip(anchors[:, 2], 0.0, width)
+  y2 = jnp.clip(anchors[:, 3], 0.0, height)
   return jnp.stack([x1, y1, x2, y2], axis=1)
 
 
