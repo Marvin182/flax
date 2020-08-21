@@ -9,7 +9,6 @@ import tensorflow as tf
 import tensorflow_datasets as tfds
 
 from anchor import generate_all_anchors, AnchorConfig
-from util import tf_jaccard_index
 
 # This controls the maximal number of bbox annotations in an image
 MAX_PADDING_ROWS = 100
