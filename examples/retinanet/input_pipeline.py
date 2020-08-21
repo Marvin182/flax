@@ -496,7 +496,19 @@ class DataPreprocessor:
         `augment_image` is True
 
     Returns:
-      [TODO]: explain what the structure of the output will be like
+      A dictionary for each image having the following entries:
+
+      ```
+       {
+        "id": <image_id>,
+        "scale": <ratio>,  # the rescale ratio
+        "image": <img_data>,
+        "size": [H, W, C],
+        "anchor_type": <anchor_type> # -1: ignored, 0: background, 1: foreground
+        "classification_labels": <classification_labels>,
+        "regression_targets": <regression_targets>,
+      }
+      ```
     """
     assert 0.0 <= augment_probability <= 1.0, "augment_probability must be " \
                                               "in the range [0.0, 1.0]"
@@ -534,18 +546,18 @@ class DataPreprocessor:
           self.compute_anchors_and_labels(bboxes, labels, new_image_h,
                                           new_image_w)
 
-      # Return the preprocessed batch
+      # Prepare the returned data structure
       return {
           "id": image_id,
-          "image": new_image,
           "scale": ratio,
+          "image": new_image,
           "size": [
               tf.cast(new_image_h, tf.int32),
               tf.cast(new_image_w, tf.int32), new_image_c
           ],
           "anchor_type": tf.cast(anchors[:, -1], dtype=tf.int32),
           "classification_labels": classification_labels,
-          "regression_targets": regression_targets
+          "regression_targets": regression_targets,
       }
 
     return _inner
