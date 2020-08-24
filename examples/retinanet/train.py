@@ -3,12 +3,15 @@ import time
 
 from absl import logging
 from clu import hooks
+from coco_eval import CocoEvaluator
 from configs.default import ConfigDict
 import flax
 from flax.metrics import tensorboard
 from flax.training import checkpoints, common_utils
+from functools import partial
 import jax
 import jax.numpy as jnp
+import numpy as np
 import tensorflow as tf
 import tensorflow_datasets as tfds
 import sys
@@ -17,7 +20,7 @@ from typing import Any, Iterable, Mapping, Tuple
 import input_pipeline
 from model import create_retinanet
 
-_EPSILON = 1e-8
+_EPSILON = 1e-9
 
 
 @flax.struct.dataclass
@@ -210,31 +213,52 @@ def retinanet_loss(classifications: jnp.array,
   return jnp.sum(fl + sl1 * reg_weight) / valid_anchors
 
 
-def compute_metrics(pred, labels):
-  """Returns the accuracy and the cross entropy.
+def compute_coco_metrics(pred,
+                         img_ids,
+                         scales,
+                         label_path,
+                         remove_background=True,
+                         threshold=0.05):
+  """Returns the COCO metrics for object detection on a batch.
 
   Args:
-    pred: the logits
-    labels: the ground truths
+    pred: the output of the model in inference mode
+    img_ids: an array of length `N`, containing the id of each of image
+    scales: an array of length `N`, containing the scale of each image
+    label_path: the path to the ground truth annotations
+    remove_background: if True removes the anchors classified as background,
+      i.e. having the greatest confidence in label 0
+    threshold: a scalar which indicates the lower threshold (inclusive) for 
+      the scores. Anything below this value will be removed.
 
   Returns:
-    A dictionary containins the metrics
+    A dictionary that contains the object detection COCO metrics on a batch.
   """
-  cross_entropy = jnp.mean(cross_entropy_loss(pred, labels))
-  accuracy = jnp.mean(jnp.argmax(pred, axis=1) == labels)
-  metrics = {"accuracy": accuracy, "cross_entropy": cross_entropy}
-  return jax.lax.pmean(metrics, "batch")
+  # CocoEvaluator is a singleton to reduce computational cost
+  evaluator = CocoEvaluator(label_path, remove_background, threshold)
+
+  # Unpack the predictions
+  scores, _, bboxes = pred
+
+  # Compute the results for this batch, and average them across devices
+  bboxes = jnp.array(bboxes)
+  scores = jnp.array(scores)
+  results = evaluator(bboxes, scores, img_ids, scales)
+  return jax.lax.pmean(results, 'batch')
 
 
-def eval_step(data, meta_state):
+def eval_step(data, meta_state, label_path, remove_background, threshold):
   """Evaluates the model.
 
-  The evaluation is done against the Log-loss and the Accuracy
-  metrics. Note, the model should be stateful.
+  The evaluation is done against the COCO object detection metrics.
 
   Args:
-    data: the test data
+    data: the evaluation data
     model: an instance of the State class
+    label_path: path to the file storing the ground truth annotations
+    remove_background: whether to remove the background anchors
+    threshold: lower bound for accepting anchors; anchors with a confidence
+      lower than this parameter are discarded
 
   Returns:
     The accuracy and the Log-loss aggregated across multiple workers.
@@ -242,12 +266,10 @@ def eval_step(data, meta_state):
   with flax.nn.stateful(meta_state.model_state, mutable=False):
     pred = meta_state.optimizer.target(
         data['image'], img_shape=data['size'], train=False)
-  return compute_metrics(pred, data['label'])
 
-
-def aggregate_evals(eval_array):
-  vals = jnp.array(list(map(lambda x: list(x.values()), eval_array)))
-  return dict(zip(eval_array[0].keys(), jnp.mean(vals, axis=0)))
+    res = compute_coco_metrics(pred, data['id'], data['scale'], label_path,
+                              remove_background, threshold)
+  return res
 
 
 def checkpoint_state(meta_state: State, checkpoint_dir: str = "checkpoints"):
@@ -358,13 +380,18 @@ def create_step_fn(lr_function):
   return take_step
 
 
-def eval_to_tensorboard(writer, evals, step):
-  evals = common_utils.get_metrics(evals)
-  summary = jax.tree_map(lambda x: x.mean(), evals)
-  logging.info("(Training Step #%d) Aggregated Metrics: %s", step, summary)
+def eval_to_tensorboard(writer, evals, step, train=True, aggregate=True):
+  if aggregate:
+    evals = common_utils.get_metrics(evals)
+    summary = jax.tree_map(lambda x: x.mean(), evals)
+    logging.info("(Training Step #%d) Aggregated Metrics: %s", step, summary)
 
   for key, vals in evals.items():
-    tag = 'train_%s' % key
+    tag = f'{"train" if train else "eval"}_{key}'
+
+    if not isinstance(vals, (list, np.ndarray)):
+      vals = [vals]
+
     for i, val in enumerate(vals):
       writer.scalar(tag, val, step - len(vals) + i + 1)
   writer.flush()
@@ -388,7 +415,8 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
 
   # Set up the data pipeline
   rng, data_rng = jax.random.split(rng)
-  ds_info, train_data, val_data = input_pipeline.create_datasets(config, data_rng)
+  ds_info, train_data, val_data = input_pipeline.create_datasets(
+      config, data_rng)
   num_classes = ds_info.features["objects"]["label"].num_classes
 
   logging.info("Training data shapes: %s", train_data.element_spec)
@@ -424,7 +452,13 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
   # Prepare the training loop for distributed runs
   step_fn = create_step_fn(learning_rate_fn)
   p_step_fn = jax.pmap(step_fn, axis_name="batch")
-  p_eval_fn = jax.pmap(eval_step, axis_name="batch")
+  p_eval_fn = jax.pmap(
+      partial(
+          eval_step,
+          label_path=config.eval_annotations_path,
+          remove_background=config.eval_remove_background,
+          threshold=config.eval_threshold),  
+      axis_name="batch")
 
   # Run the training loop
   running_metrics = []
@@ -451,14 +485,7 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
         eval_to_tensorboard(summary_writer, running_metrics, step)
         running_metrics.clear()
 
-    # Do some checkpointing
-    if step % 100 == 0 and step != 0:
-      meta_state = sync_model_state(meta_state)
-      checkpoint_state(meta_state)
-
-    continue
-
-    # Sync the model state, Evaluate and checkpoint the model
+    # Sync the model state, evaluate and checkpoint the model
     if step % config.checkpoint_period == 0 and step != 0:
       # Checkpoint the model
       meta_state = sync_model_state(meta_state)
@@ -466,14 +493,24 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
 
       # Run evaluation on the model
       eval_results = []
-      test_iter = iter(test_data)
-      for _ in range(100):
-        batch = jax.tree_map(lambda x: x._numpy(), next(test_iter))  # pylint: disable=protected-access
+      val_iter = iter(val_data)  # Refresh the eval iterator
+      for _ in range(500):
+        batch = jax.tree_map(lambda x: x._numpy(), next(val_iter))  # pylint: disable=protected-access
         results = p_eval_fn(batch, meta_state)
         eval_results.append(results)
-      eval_results = aggregate_evals(eval_results)
+      eval_results = common_utils.get_metrics(eval_results)
+      eval_results = jax.tree_map(lambda x: x.mean(), eval_results)
 
       checkpoint = step // config.checkpoint_period
-      logging.info("(Checkpoint #%d) RetinaNet loss: %s.", checkpoint, metrics)
+      logging.info("(Checkpoint #%d) COCO Metrics: %s.", checkpoint,
+                   eval_results)
+
+      # Write the evaluation results to tensorboard
+      eval_to_tensorboard(
+          summary_writer,
+          eval_results,
+          checkpoint,
+          train=False,
+          aggregate=False)
 
   return meta_state
