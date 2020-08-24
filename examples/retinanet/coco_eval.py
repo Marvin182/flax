@@ -1,9 +1,9 @@
-from jax import numpy as jnp
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
 import jax
 import json
+import numpy as np
 
 # A dictionary which converts model labels to COCO labels
 MODEL_TO_COCO = {
@@ -90,7 +90,15 @@ MODEL_TO_COCO = {
 }
 
 
-class CocoEvaluator():
+class CocoEvaluatorMeta(type):
+  _instances = {}
+  def __call__(cls, *args, **kwargs):
+    if cls not in cls._instances:
+      cls._instances[cls] = super(CocoEvaluatorMeta, cls).__call__(*args, **kwargs)
+    return cls._instances[cls]
+
+
+class CocoEvaluator(metaclass=CocoEvaluatorMeta):
   """We use the singleton pattern here to avoid re-reading the annotations.
   """
 
@@ -110,6 +118,33 @@ class CocoEvaluator():
     self.threshold = threshold
     self.remove_background = remove_background
     self.coco = COCO(annotations_loc)
+
+  @staticmethod
+  def construct_result_dict(coco_metrics):
+    """Packs the COCOEval results into a dictionary
+
+    Args:
+      coco_metrics: an array of length 12, as returned by `COCOeval.summarize()`
+
+    Returns:
+      A dictionary which contains all the COCO metrics. For more details, 
+      visit: https://cocodataset.org/#detection-eval.
+    """
+    return {
+      "AP": coco_metrics[0],
+      "AP_50": coco_metrics[1],
+      "AP_75": coco_metrics[2],
+      "AP_small": coco_metrics[3],
+      "AP_medium": coco_metrics[4],
+      "AP_large": coco_metrics[5],
+      "AR_max_1": coco_metrics[6],
+      "AR_max_10": coco_metrics[7],
+      "AR_max_100": coco_metrics[8],
+      "AR_small": coco_metrics[9],
+      "AR_medium": coco_metrics[10],
+      "AR_large": coco_metrics[11]
+    }
+
 
   def extract_classifications(self, bboxes, scores):
     """Extracts the label for each bbox, and sorts the results by score.
@@ -157,20 +192,21 @@ class CocoEvaluator():
 
     return bboxes, labels, scores
 
-  def __call__(self, bboxes, scores, img_id, scale):
-    """Compute the COCO metrics.
+  def __call__(self, bboxes, scores, img_ids, scale):
+    """Compute the COCO metrics on a batch.
 
     Args:
       bboxes: an array of the form (N, |B|, 4), where `N` is the batch size
         |B| is the number of bboxes containing the bboxes information
       scores: an array of the form (N, |B|, K), where `K` is the number of 
         classes. This array contains the confidence scores for each anchor
-      img_od: an array of length `N`, containing the id of each of image
+      img_ids: an array of length `N`, containing the id of each of image
       scale: an array of length `N`, containing the scale of each image
 
     Returns:
-      The COCO metrics as an array of length 12, defining the following:
+      The COCO metrics as an array of length 12, defining the following entries:
 
+      ```
       Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ]
       Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ]
       Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] 
@@ -183,12 +219,13 @@ class CocoEvaluator():
       Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] 
       Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] 
       Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] 
+      ```
     """
 
     def _inner(idx):
       # Get the sorted bboxes, labels and scores
       i_bboxes, i_labels, i_scores = self.extract_classifications(
-          bboxes[idx, ...], scores[idx, ...])
+          bboxes[idx], scores[idx])
 
       # Rescale bboxes to original size
       i_bboxes = i_bboxes / scale[idx]
@@ -198,7 +235,7 @@ class CocoEvaluator():
       i_bboxes[:, 3] -= i_bboxes[:, 1]
 
       # Iterate through the promising predictions, and pack them in json format
-      i_img_id = img_id[idx]
+      i_img_id = img_ids[idx]
       img_classifications = []
       for bbox, label, score in zip(i_bboxes, i_labels, i_scores):
         single_classification = {
@@ -218,13 +255,14 @@ class CocoEvaluator():
       detections.extend(partial)
 
     # Create prediction object for producing mAP metric values
-    print(detections)
     pred_object = self.coco.loadRes(detections)
 
-    # Compute mAP on this specific image
+    # Compute mAP
     coco_eval = COCOeval(self.coco, pred_object, 'bbox')
-    coco_eval.params.imgIds = img_id.flatten().tolist()  # Only this image
+    coco_eval.params.imgIds = img_ids  # Only batch images
     coco_eval.evaluate()
     coco_eval.accumulate()
     coco_eval.summarize()
-    return coco_eval.stats
+
+    # Pack the results     
+    return self.construct_result_dict(coco_eval.stats)
