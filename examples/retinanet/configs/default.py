@@ -38,9 +38,14 @@ def get_config():
   # The number of layers in the RetinaNet backbone.
   config.depth = 50
 
-  config.sync_steps = 10
-  config.checkpoint_period = 20_000
+  config.sync_steps = 100
+  config.checkpoint_period = 10  # TODO: once it works, reduce this frequency
 
   config.seed = 42
+
+  # Evaluation parameters
+  config.eval_annotations_path = "/home/dgraur/data/files/coco_annotations/instances_val2014.json"
+  config.eval_remove_background = True
+  config.eval_threshold = 0.05
 
   return config

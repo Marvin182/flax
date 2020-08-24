@@ -92,9 +92,11 @@ MODEL_TO_COCO = {
 
 class CocoEvaluatorMeta(type):
   _instances = {}
+
   def __call__(cls, *args, **kwargs):
     if cls not in cls._instances:
-      cls._instances[cls] = super(CocoEvaluatorMeta, cls).__call__(*args, **kwargs)
+      cls._instances[cls] = super(CocoEvaluatorMeta,
+                                  cls).__call__(*args, **kwargs)
     return cls._instances[cls]
 
 
@@ -112,7 +114,7 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
       remove_background: if True removes the anchors classified as background,
         i.e. having the greatest confidence on label 0
       threshold: a scalar which indicates the lower threshold (inclusive) for 
-        the scores. Anything below this value will be set to -1.0
+        the scores. Anything below this value will be removed.
 
     """
     self.threshold = threshold
@@ -131,20 +133,19 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
       visit: https://cocodataset.org/#detection-eval.
     """
     return {
-      "AP": coco_metrics[0],
-      "AP_50": coco_metrics[1],
-      "AP_75": coco_metrics[2],
-      "AP_small": coco_metrics[3],
-      "AP_medium": coco_metrics[4],
-      "AP_large": coco_metrics[5],
-      "AR_max_1": coco_metrics[6],
-      "AR_max_10": coco_metrics[7],
-      "AR_max_100": coco_metrics[8],
-      "AR_small": coco_metrics[9],
-      "AR_medium": coco_metrics[10],
-      "AR_large": coco_metrics[11]
+        "AP": coco_metrics[0],
+        "AP_50": coco_metrics[1],
+        "AP_75": coco_metrics[2],
+        "AP_small": coco_metrics[3],
+        "AP_medium": coco_metrics[4],
+        "AP_large": coco_metrics[5],
+        "AR_max_1": coco_metrics[6],
+        "AR_max_10": coco_metrics[7],
+        "AR_max_100": coco_metrics[8],
+        "AR_small": coco_metrics[9],
+        "AR_medium": coco_metrics[10],
+        "AR_large": coco_metrics[11]
     }
-
 
   def extract_classifications(self, bboxes, scores):
     """Extracts the label for each bbox, and sorts the results by score.
@@ -192,7 +193,7 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
 
     return bboxes, labels, scores
 
-  def __call__(self, bboxes, scores, img_ids, scale):
+  def __call__(self, bboxes, scores, img_ids, scales):
     """Compute the COCO metrics on a batch.
 
     Args:
@@ -201,7 +202,7 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
       scores: an array of the form (N, |B|, K), where `K` is the number of 
         classes. This array contains the confidence scores for each anchor
       img_ids: an array of length `N`, containing the id of each of image
-      scale: an array of length `N`, containing the scale of each image
+      scales: an array of length `N`, containing the scales of each image
 
     Returns:
       The COCO metrics as an array of length 12, defining the following entries:
@@ -228,7 +229,7 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
           bboxes[idx], scores[idx])
 
       # Rescale bboxes to original size
-      i_bboxes = i_bboxes / scale[idx]
+      i_bboxes = i_bboxes / scales[idx]
 
       # Adjust bboxes to COCO standard: [x1, y1, w, h]
       i_bboxes[:, 2] -= i_bboxes[:, 0]
@@ -264,5 +265,5 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
     coco_eval.accumulate()
     coco_eval.summarize()
 
-    # Pack the results     
+    # Pack the results
     return self.construct_result_dict(coco_eval.stats)
