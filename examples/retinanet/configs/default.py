@@ -39,7 +39,7 @@ def get_config():
   config.depth = 50
 
   config.sync_steps = 100
-  config.checkpoint_period = 10  # TODO: once it works, reduce this frequency
+  config.checkpoint_period = 5_000
 
   config.seed = 42
 

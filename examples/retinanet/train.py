@@ -213,12 +213,13 @@ def retinanet_loss(classifications: jnp.array,
   return jnp.sum(fl + sl1 * reg_weight) / valid_anchors
 
 
-def compute_coco_metrics(pred,
-                         img_ids,
-                         scales,
-                         label_path,
-                         remove_background=True,
-                         threshold=0.05):
+def coco_eval_step(bboxes,
+                   scores,
+                   img_ids,
+                   scales,
+                   label_path,
+                   remove_background=True,
+                   threshold=0.05):
   """Returns the COCO metrics for object detection on a batch.
 
   Args:
@@ -234,42 +235,57 @@ def compute_coco_metrics(pred,
   Returns:
     A dictionary that contains the object detection COCO metrics on a batch.
   """
+  # Reshape the data such that it can be processed
+  bboxes_shape = bboxes.shape
+  bboxes = bboxes.reshape(-1, bboxes_shape[-2], bboxes_shape[-1])
+
+  scores_shape = scores.shape
+  scores = scores.reshape(-1, scores_shape[-2], scores_shape[-1])
+
+  img_ids = img_ids.reshape(-1)
+  scales = scales.reshape(-1)
+
   # CocoEvaluator is a singleton to reduce computational cost
   evaluator = CocoEvaluator(label_path, remove_background, threshold)
 
-  # Unpack the predictions
-  scores, _, bboxes = pred
-
-  # Compute the results for this batch, and average them across devices
-  bboxes = jnp.array(bboxes)
-  scores = jnp.array(scores)
-  results = evaluator(bboxes, scores, img_ids, scales)
-  return jax.lax.pmean(results, 'batch')
+  # Compute the results for this batch
+  bboxes = np.array(bboxes)
+  scores = np.array(scores)
+  return evaluator(bboxes, scores, img_ids, scales)
 
 
-def eval_step(data, meta_state, label_path, remove_background, threshold):
-  """Evaluates the model.
-
-  The evaluation is done against the COCO object detection metrics.
+def sync_results(results):
+  """Synchronize results across hosts.
 
   Args:
-    data: the evaluation data
-    model: an instance of the State class
-    label_path: path to the file storing the ground truth annotations
-    remove_background: whether to remove the background anchors
-    threshold: lower bound for accepting anchors; anchors with a confidence
-      lower than this parameter are discarded
+    results: the locally synchronized results
 
   Returns:
-    The accuracy and the Log-loss aggregated across multiple workers.
+    The results synchronized across hosts
+  """
+  vals, tree_def = jax.tree_util.tree_flatten(results)
+  results = jnp.array(vals)
+  results = jnp.expand_dims(results, axis=0)
+  results = jnp.tile(results, (jax.local_device_count(), 1))
+  results = jax.pmap(lambda x: jax.lax.pmean(x, 'batch'), 'batch')(results)
+  return jax.tree_util.build_tree(tree_def, results[0])
+
+
+def infer(data, meta_state):
+  """Infers on data.
+
+  Args:
+    data: the data for inference
+    model: an instance of the State class
+
+  Returns:
+    The inference on the data, i.e. the tuple consisting of: classifications, 
+    regressions, bboxes 
   """
   with flax.nn.stateful(meta_state.model_state, mutable=False):
     pred = meta_state.optimizer.target(
         data['image'], img_shape=data['size'], train=False)
-
-    res = compute_coco_metrics(pred, data['id'], data['scale'], label_path,
-                              remove_background, threshold)
-  return res
+  return pred
 
 
 def checkpoint_state(meta_state: State, checkpoint_dir: str = "checkpoints"):
@@ -452,13 +468,14 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
   # Prepare the training loop for distributed runs
   step_fn = create_step_fn(learning_rate_fn)
   p_step_fn = jax.pmap(step_fn, axis_name="batch")
-  p_eval_fn = jax.pmap(
-      partial(
-          eval_step,
-          label_path=config.eval_annotations_path,
-          remove_background=config.eval_remove_background,
-          threshold=config.eval_threshold),  
-      axis_name="batch")
+  p_infer_fn = jax.pmap(infer, axis_name="batch")
+
+  # Use partial for less verbose code
+  eval_step = partial(
+      coco_eval_step,
+      label_path=config.eval_annotations_path,
+      remove_background=config.eval_remove_background,
+      threshold=config.eval_threshold)
 
   # Run the training loop
   running_metrics = []
@@ -494,13 +511,20 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
       # Run evaluation on the model
       eval_results = []
       val_iter = iter(val_data)  # Refresh the eval iterator
-      for _ in range(500):
+      for _ in range(1000):
         batch = jax.tree_map(lambda x: x._numpy(), next(val_iter))  # pylint: disable=protected-access
-        results = p_eval_fn(batch, meta_state)
+        scores, regressions, bboxes = p_infer_fn(batch, meta_state)
+        results = eval_step(bboxes, scores, batch["id"], batch["scale"])
         eval_results.append(results)
-      eval_results = common_utils.get_metrics(eval_results)
-      eval_results = jax.tree_map(lambda x: x.mean(), eval_results)
 
+      # Transform a list of dicts to a dict with list entries
+      eval_results = common_utils.stack_forest(eval_results)
+
+      # Copmpute the mean of each metric, then sync across hosts
+      eval_results = jax.tree_map(lambda x: x.mean(), eval_results)
+      eval_results = sync_results(eval_results)
+
+      # Log the reports via standard logging
       checkpoint = step // config.checkpoint_period
       logging.info("(Checkpoint #%d) COCO Metrics: %s.", checkpoint,
                    eval_results)

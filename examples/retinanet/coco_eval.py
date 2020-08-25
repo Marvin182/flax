@@ -4,6 +4,8 @@ from pycocotools.cocoeval import COCOeval
 import jax
 import json
 import numpy as np
+import os
+import sys
 
 # A dictionary which converts model labels to COCO labels
 MODEL_TO_COCO = {
@@ -104,7 +106,11 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
   """We use the singleton pattern here to avoid re-reading the annotations.
   """
 
-  def __init__(self, annotations_loc, remove_background=True, threshold=0.05):
+  def __init__(self,
+               annotations_loc,
+               remove_background=True,
+               threshold=0.05,
+               disable_output=True):
     """Initializes a CocoEvaluator object.
 
     Args:
@@ -115,9 +121,11 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
         i.e. having the greatest confidence on label 0
       threshold: a scalar which indicates the lower threshold (inclusive) for 
         the scores. Anything below this value will be removed.
+      disable_output: if True disables the output produced by the COCO API
 
     """
     self.threshold = threshold
+    self.disable_output = disable_output
     self.remove_background = remove_background
     self.coco = COCO(annotations_loc)
 
@@ -196,6 +204,9 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
   def __call__(self, bboxes, scores, img_ids, scales):
     """Compute the COCO metrics on a batch.
 
+    Note that this method may raise an exception if the `threshold` is too
+    high and thus eliminates all detections.
+
     Args:
       bboxes: an array of the form (N, |B|, 4), where `N` is the batch size
         |B| is the number of bboxes containing the bboxes information
@@ -255,6 +266,10 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
     for partial in map(_inner, range(bboxes.shape[0])):
       detections.extend(partial)
 
+    # Disable stdout if requested
+    if self.disable_output:
+      sys.stdout = open(os.devnull, 'w')
+
     # Create prediction object for producing mAP metric values
     pred_object = self.coco.loadRes(detections)
 
@@ -264,6 +279,10 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
     coco_eval.evaluate()
     coco_eval.accumulate()
     coco_eval.summarize()
+
+    # Re-enable stdout if requested
+    if self.disable_output:
+      sys.stdout = sys.__stdout__
 
     # Pack the results
     return self.construct_result_dict(coco_eval.stats)
