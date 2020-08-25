@@ -104,6 +104,10 @@ class CocoEvaluatorMeta(type):
 
 class CocoEvaluator(metaclass=CocoEvaluatorMeta):
   """We use the singleton pattern here to avoid re-reading the annotations.
+
+  Note that this class is NOT thread safe, and should carefully be used by only
+  one thread at once due to it's statefulness! 
+
   """
 
   def __init__(self,
@@ -124,6 +128,8 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
       disable_output: if True disables the output produced by the COCO API
 
     """
+    self.annotations = []
+    self.annotated_img_ids = []
     self.threshold = threshold
     self.disable_output = disable_output
     self.remove_background = remove_background
@@ -154,6 +160,16 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
         "AR_medium": coco_metrics[10],
         "AR_large": coco_metrics[11]
     }
+
+  def clear_annotations(self):
+    """Clears the annotations collected in this object. 
+
+    It is important to call this method either at the end or at the beginning
+    of a new evaluation round (or both). Otherwise, previous model inferences
+    will skew the results due to residual annotations. 
+    """
+    self.annotations.clear()
+    self.annotated_img_ids.clear()
 
   def extract_classifications(self, bboxes, scores):
     """Extracts the label for each bbox, and sorts the results by score.
@@ -201,8 +217,8 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
 
     return bboxes, labels, scores
 
-  def __call__(self, bboxes, scores, img_ids, scales):
-    """Compute the COCO metrics on a batch.
+  def add_annotations(self, bboxes, scores, img_ids, scales):
+    """Add a batch of inferences as COCO annotations for later evaluation
 
     Note that this method may raise an exception if the `threshold` is too
     high and thus eliminates all detections.
@@ -214,24 +230,6 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
         classes. This array contains the confidence scores for each anchor
       img_ids: an array of length `N`, containing the id of each of image
       scales: an array of length `N`, containing the scales of each image
-
-    Returns:
-      The COCO metrics as an array of length 12, defining the following entries:
-
-      ```
-      Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ]
-      Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ]
-      Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] 
-      Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] 
-      Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]
-      Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] 
-      Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] 
-      Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] 
-      Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] 
-      Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] 
-      Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] 
-      Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] 
-      ```
     """
 
     def _inner(idx):
@@ -262,20 +260,47 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
       return img_classifications
 
     # Structure the predictions for each of the images and collect them
-    detections = []
     for partial in map(_inner, range(bboxes.shape[0])):
-      detections.extend(partial)
+      self.annotations.extend(partial)
 
+    # Add the evaluated image ids
+    self.annotated_img_ids.extend(img_ids)
+
+  def compute_coco_metrics(self, clear_collected_annotations=False):
+    """Compute the COCO metrics for the collected annotations
+
+    Args:
+      clear_collected_annotations: if True, clears the `self.annotations` 
+        parameter after obtaining the COCO metrics
+    
+    Returns:
+      The COCO metrics as a dictionary, defining the following entries:
+
+      ```
+      Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ]
+      Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ]
+      Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] 
+      Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] 
+      Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ]
+      Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] 
+      Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] 
+      Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] 
+      Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] 
+      Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] 
+      Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] 
+      Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] 
+      ```
+    """
     # Disable stdout if requested
     if self.disable_output:
       sys.stdout = open(os.devnull, 'w')
 
     # Create prediction object for producing mAP metric values
-    pred_object = self.coco.loadRes(detections)
+    pred_object = self.coco.loadRes(self.annotations)
 
     # Compute mAP
     coco_eval = COCOeval(self.coco, pred_object, 'bbox')
-    coco_eval.params.imgIds = img_ids  # Only batch images
+    coco_eval.params.imgIds = self.annotated_img_ids  # Only batch images
     coco_eval.evaluate()
     coco_eval.accumulate()
     coco_eval.summarize()
@@ -283,6 +308,10 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
     # Re-enable stdout if requested
     if self.disable_output:
       sys.stdout = sys.__stdout__
+
+    # Clear annotations if requested
+    if clear_collected_annotations:
+      self.clear_annotations()
 
     # Pack the results
     return self.construct_result_dict(coco_eval.stats)

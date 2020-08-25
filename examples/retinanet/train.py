@@ -213,27 +213,14 @@ def retinanet_loss(classifications: jnp.array,
   return jnp.sum(fl + sl1 * reg_weight) / valid_anchors
 
 
-def coco_eval_step(bboxes,
-                   scores,
-                   img_ids,
-                   scales,
-                   label_path,
-                   remove_background=True,
-                   threshold=0.05):
-  """Returns the COCO metrics for object detection on a batch.
+def coco_eval_step(bboxes, scores, img_ids, scales, evaluator):
+  """Adds a set of batch inferences to the COCO evaluation object
 
   Args:
     pred: the output of the model in inference mode
     img_ids: an array of length `N`, containing the id of each of image
     scales: an array of length `N`, containing the scale of each image
-    label_path: the path to the ground truth annotations
-    remove_background: if True removes the anchors classified as background,
-      i.e. having the greatest confidence in label 0
-    threshold: a scalar which indicates the lower threshold (inclusive) for 
-      the scores. Anything below this value will be removed.
-
-  Returns:
-    A dictionary that contains the object detection COCO metrics on a batch.
+    evaluator: a CocoEvaluator object, used to process the inferences
   """
   # Reshape the data such that it can be processed
   bboxes_shape = bboxes.shape
@@ -245,13 +232,12 @@ def coco_eval_step(bboxes,
   img_ids = img_ids.reshape(-1)
   scales = scales.reshape(-1)
 
-  # CocoEvaluator is a singleton to reduce computational cost
-  evaluator = CocoEvaluator(label_path, remove_background, threshold)
-
-  # Compute the results for this batch
+  # Convert to numpy to avoid incompatibility issues
   bboxes = np.array(bboxes)
   scores = np.array(scores)
-  return evaluator(bboxes, scores, img_ids, scales)
+
+  # Add the annotations and return the evaluator
+  evaluator.add_annotations(bboxes, scores, img_ids, scales)
 
 
 def sync_results(results):
@@ -470,12 +456,10 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
   p_step_fn = jax.pmap(step_fn, axis_name="batch")
   p_infer_fn = jax.pmap(infer, axis_name="batch")
 
-  # Use partial for less verbose code
-  eval_step = partial(
-      coco_eval_step,
-      label_path=config.eval_annotations_path,
-      remove_background=config.eval_remove_background,
-      threshold=config.eval_threshold)
+  # Note that the CocoEvaluator is a singleton object
+  coco_evaluator = CocoEvaluator(config.eval_annotations_path,
+                                 config.eval_remove_background,
+                                 config.eval_threshold)
 
   # Run the training loop
   running_metrics = []
@@ -509,20 +493,16 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
       checkpoint_state(meta_state)
 
       # Run evaluation on the model
-      eval_results = []
+      coco_evaluator.clear_annotations()  # Clear former annotations
       val_iter = iter(val_data)  # Refresh the eval iterator
-      for _ in range(1000):
+      for _ in range(500):
         batch = jax.tree_map(lambda x: x._numpy(), next(val_iter))  # pylint: disable=protected-access
         scores, regressions, bboxes = p_infer_fn(batch, meta_state)
-        results = eval_step(bboxes, scores, batch["id"], batch["scale"])
-        eval_results.append(results)
+        coco_eval_step(bboxes, scores, batch["id"], batch["scale"],
+                       coco_evaluator)
 
-      # Transform a list of dicts to a dict with list entries
-      eval_results = common_utils.stack_forest(eval_results)
-
-      # Copmpute the mean of each metric, then sync across hosts
-      eval_results = jax.tree_map(lambda x: x.mean(), eval_results)
-      eval_results = sync_results(eval_results)
+      # Compute the COCO metrics
+      eval_results = coco_evaluator.compute_coco_metrics()
 
       # Log the reports via standard logging
       checkpoint = step // config.checkpoint_period
