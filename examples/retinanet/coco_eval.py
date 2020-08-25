@@ -266,6 +266,28 @@ class CocoEvaluator(metaclass=CocoEvaluatorMeta):
     # Add the evaluated image ids
     self.annotated_img_ids.extend(img_ids)
 
+  def get_annotations_and_ids(self):
+    """Returns copies of `self.annotations` and `self.annotated_img_ids`.
+
+    Returns:
+      Copies of `self.annotations` and `self.annotated_img_ids`.
+    """
+    return self.annotations.copy(), self.annotated_img_ids.copy()
+
+  def set_annotations_and_ids(self, annotations, ids):
+    """Sets the `self.annotations` and `self.annotated_img_ids`.
+
+    This method should only be used when trying to compute the metrics across
+    hosts, where one host captures the data from everyone in an effort to 
+    produce the entire dataset metrics.
+
+    Args:
+      annotations: the new `annotations`
+      ids: the new `annotated_img_ids`
+    """
+    self.annotations = annotations
+    self.annotated_img_ids = ids
+
   def compute_coco_metrics(self, clear_collected_annotations=False):
     """Compute the COCO metrics for the collected annotations
 

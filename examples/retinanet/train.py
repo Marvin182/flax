@@ -240,20 +240,32 @@ def coco_eval_step(bboxes, scores, img_ids, scales, evaluator):
   evaluator.add_annotations(bboxes, scores, img_ids, scales)
 
 
-def sync_results(results):
-  """Synchronize results across hosts.
+def sync_results(coco_evaluator):
+  """Synchronize the CocoEvaluator across hosts, and produce the COCO metrics.
 
   Args:
-    results: the locally synchronized results
+    coco_evaluator: the local CocoEvaluator object
 
   Returns:
     The results synchronized across hosts
   """
-  vals, tree_def = jax.tree_util.tree_flatten(results)
-  results = jnp.array(vals)
-  results = jnp.expand_dims(results, axis=0)
-  results = jnp.tile(results, (jax.local_device_count(), 1))
-  results = jax.pmap(lambda x: jax.lax.pmean(x, 'batch'), 'batch')(results)
+  # Get the local annotations, and clear the evaluator
+  annotations, ids = coco_evaluator.get_annotations_and_ids()
+  coco_evaluator.clear_annotations()
+
+  def _inner(x):
+    i_annotations = jax.lax.all_gather(annotations, 'batch')
+    i_ids = jax.lax.all_gather(ids, 'batch')
+
+    return i_annotations, i_ids
+  inner = jax.pmap(_inner, 'batch')
+
+
+  # Compute the results this is host 0
+  inner()
+  if jax.host_id() == 0:
+    coco_evaluator.set_annotations_and_ids(annotations, ids) 
+
   return jax.tree_util.build_tree(tree_def, results[0])
 
 
