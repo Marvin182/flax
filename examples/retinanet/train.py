@@ -507,7 +507,7 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
       # Run evaluation on the model
       coco_evaluator.clear_annotations()  # Clear former annotations
       val_iter = iter(val_data)  # Refresh the eval iterator
-      for _ in range(500):
+      for _ in range(250):
         batch = jax.tree_map(lambda x: x._numpy(), next(val_iter))  # pylint: disable=protected-access
         scores, regressions, bboxes = p_infer_fn(batch, meta_state)
         coco_eval_step(bboxes, scores, batch["id"], batch["scale"],

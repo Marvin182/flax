@@ -39,8 +39,7 @@ def get_config():
   config.depth = 50
 
   config.sync_steps = 100
-  config.checkpoint_period = 5_000
-
+  config.checkpoint_period = 1_500
   config.seed = 42
 
   # Evaluation parameters
