@@ -3,7 +3,7 @@ import time
 
 from absl import logging
 from clu import hooks
-from configs.default import ConfigDict
+import ml_collections
 import flax
 from flax.metrics import tensorboard
 from flax.training import checkpoints, common_utils
@@ -83,8 +83,7 @@ def create_scheduled_decay_fn(learning_rate: float,
 def create_model(rng: jnp.ndarray,
                  depth: int = 50,
                  classes: int = 1000,
-                 shape: Iterable[int] = (224, 224, 3),
-                 dtype: jnp.dtype = jnp.float32) -> flax.nn.Model:
+                 shape: Iterable[int] = (224, 224, 3)) -> flax.nn.Model:
   """Creates a RetinaNet model.
 
   Args:
@@ -92,13 +91,12 @@ def create_model(rng: jnp.ndarray,
     depth: the depth of the basckbone network
     classes: the number of classes in the object detection task
     shape: the shape of the image inputs, with the format (N, H, W, C)
-    dtype: the data type of the model
 
   Returns:
     The RetinaNet instance, and its state object
   """
   # The number of classes is increased by 1 since we add the background
-  partial_module = create_retinanet(depth, classes=classes + 1, dtype=dtype)
+  partial_module = create_retinanet(depth, classes=classes + 1)
 
   # Since the BatchNorm has state, we'll need to use stateful here
   with flax.nn.stateful() as init_state:
@@ -370,7 +368,7 @@ def eval_to_tensorboard(writer, evals, step):
   writer.flush()
 
 
-def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
+def train_and_evaluate(config: ml_collections.ConfigDict, workdir: str) -> State:
   """Runs a training and evaluation loop.
 
   Args:
@@ -401,8 +399,7 @@ def train_and_evaluate(config: ConfigDict, workdir: str) -> State:
       model_rng,
       shape=input_shape,
       classes=num_classes,
-      depth=config.depth,
-      dtype=config.dtype)
+      depth=config.depth)
   optimizer = create_optimizer(model, beta=0.9, weight_decay=0.0001)
   meta_state = State(optimizer=optimizer, model_state=model_state)
   del model, model_state, optimizer
